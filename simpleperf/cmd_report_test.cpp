@@ -343,6 +343,13 @@ TEST_F(ReportCommandTest, report_dumped_symbols) {
   ASSERT_NE(content.find("memcpy"), std::string::npos);
 }
 
+TEST_F(ReportCommandTest, report_dumped_symbols_with_symfs_dir) {
+  // Check if we can report symbols when they appear both in perf.data and symfs dir.
+  Report(PERF_DATA_WITH_SYMBOLS, {"--symfs", GetTestDataDir()});
+  ASSERT_TRUE(success);
+  ASSERT_NE(content.find("main"), std::string::npos);
+}
+
 TEST_F(ReportCommandTest, report_sort_vaddr_in_file) {
   Report(PERF_DATA, {"--sort", "vaddr_in_file"});
   ASSERT_TRUE(success);
@@ -437,6 +444,16 @@ TEST_F(ReportCommandTest, max_stack_and_percent_limit_option) {
   ASSERT_NE(content.find("89.03"), std::string::npos);
 }
 
+TEST_F(ReportCommandTest, kallsyms_option) {
+  Report(PERF_DATA, {"--kallsyms", GetTestData("kallsyms")});
+  ASSERT_TRUE(success);
+  ASSERT_NE(content.find("FakeKernelSymbol"), std::string::npos);
+}
+
+TEST_F(ReportCommandTest, invalid_perf_data) {
+  ASSERT_FALSE(ReportCmd()->Run({"-i", GetTestData(INVALID_PERF_DATA)}));
+}
+
 #if defined(__linux__)
 #include "event_selection_set.h"
 
@@ -446,9 +463,12 @@ static std::unique_ptr<Command> RecordCmd() {
 
 TEST_F(ReportCommandTest, dwarf_callgraph) {
   if (IsDwarfCallChainSamplingSupported()) {
+    std::vector<std::unique_ptr<Workload>> workloads;
+    CreateProcesses(1, &workloads);
+    std::string pid = std::to_string(workloads[0]->GetPid());
     TemporaryFile tmp_file;
     ASSERT_TRUE(
-        RecordCmd()->Run({"-g", "-o", tmp_file.path, "sleep", SLEEP_SEC}));
+        RecordCmd()->Run({"-p", pid, "-g", "-o", tmp_file.path, "sleep", SLEEP_SEC}));
     ReportRaw(tmp_file.path, {"-g"});
     ASSERT_TRUE(success);
   } else {

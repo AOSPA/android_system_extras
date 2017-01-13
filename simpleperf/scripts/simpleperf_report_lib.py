@@ -21,26 +21,14 @@
 
 import ctypes as ct
 import os
+import subprocess
 import sys
-
-
-def _isWindows():
-    return sys.platform == 'win32' or sys.platform == 'cygwin'
-
-
-def _get_script_path():
-    return os.path.dirname(os.path.realpath(__file__))
+import unittest
+from utils import *
 
 
 def _get_native_lib():
-    if _isWindows():
-        so_name = 'libsimpleperf_report.dll'
-    elif sys.platform == 'darwin': # OSX
-        so_name = 'libsimpleperf_report.dylib'
-    else:
-        so_name = 'libsimpleperf_report.so'
-
-    return os.path.join(_get_script_path(), so_name)
+    return get_host_binary_path('libsimpleperf_report.so')
 
 
 def _is_null(p):
@@ -53,6 +41,12 @@ def _char_pt(str):
     # In python 3, str are wide strings whereas the C api expects 8 bit strings, hence we have to convert
     # For now using utf-8 as the encoding.
     return str.encode('utf-8')
+
+
+def _char_pt_to_str(char_pt):
+    if sys.version_info < (3, 0):
+        return char_pt
+    return char_pt.decode('utf-8')
 
 
 class SampleStruct(ct.Structure):
@@ -73,7 +67,8 @@ class EventStruct(ct.Structure):
 class SymbolStruct(ct.Structure):
     _fields_ = [('dso_name', ct.c_char_p),
                 ('vaddr_in_file', ct.c_uint64),
-                ('symbol_name', ct.c_char_p)]
+                ('symbol_name', ct.c_char_p),
+                ('symbol_addr', ct.c_uint64)]
 
 
 class CallChainEntryStructure(ct.Structure):
@@ -84,6 +79,47 @@ class CallChainEntryStructure(ct.Structure):
 class CallChainStructure(ct.Structure):
     _fields_ = [('nr', ct.c_uint32),
                 ('entries', ct.POINTER(CallChainEntryStructure))]
+
+
+# convert char_p to str for python3.
+class SampleStructUsingStr(object):
+    def __init__(self, sample):
+        self.ip = sample.ip
+        self.pid = sample.pid
+        self.tid = sample.tid
+        self.thread_comm = _char_pt_to_str(sample.thread_comm)
+        self.time = sample.time
+        self.in_kernel = sample.in_kernel
+        self.cpu = sample.cpu
+        self.period = sample.period
+
+
+class EventStructUsingStr(object):
+    def __init__(self, event):
+        self.name = _char_pt_to_str(event.name)
+
+
+class SymbolStructUsingStr(object):
+    def __init__(self, symbol):
+        self.dso_name = _char_pt_to_str(symbol.dso_name)
+        self.vaddr_in_file = symbol.vaddr_in_file
+        self.symbol_name = _char_pt_to_str(symbol.symbol_name)
+        self.symbol_addr = symbol.symbol_addr
+
+
+class CallChainEntryStructureUsingStr(object):
+    def __init__(self, entry):
+        self.ip = entry.ip
+        self.symbol = SymbolStructUsingStr(entry.symbol)
+
+
+class CallChainStructureUsingStr(object):
+    def __init__(self, callchain):
+        self.nr = callchain.nr
+        self.entries = []
+        for i in range(self.nr):
+            self.entries.append(CallChainEntryStructureUsingStr(callchain.entries[i]))
+
 
 class ReportLibStructure(ct.Structure):
     _fields_ = []
@@ -114,16 +150,22 @@ class ReportLib(object):
         self._GetCallChainOfCurrentSampleFunc = self._lib.GetCallChainOfCurrentSample
         self._GetCallChainOfCurrentSampleFunc.restype = ct.POINTER(
             CallChainStructure)
+        self._GetBuildIdForPathFunc = self._lib.GetBuildIdForPath
+        self._GetBuildIdForPathFunc.restype = ct.c_char_p
         self._instance = self._CreateReportLibFunc()
         assert(not _is_null(self._instance))
+
+        self.convert_to_str = (sys.version_info >= (3, 0))
 
     def _load_dependent_lib(self):
         # As the windows dll is built with mingw we need to also find "libwinpthread-1.dll".
         # Load it before libsimpleperf_report.dll if it does exist in the same folder as this script.
-        if _isWindows():
-            libwinpthread_path = os.path.join(_get_script_path(), "libwinpthread-1.dll")
+        if is_windows():
+            libwinpthread_path = os.path.join(get_script_dir(), "libwinpthread-1.dll")
             if os.path.exists(libwinpthread_path):
                 self._libwinpthread = ct.CDLL(libwinpthread_path)
+            else:
+                log_fatal('%s is missing' % libwinpthread_path)
 
     def Close(self):
         if self._instance is None:
@@ -158,22 +200,35 @@ class ReportLib(object):
         sample = self._GetNextSampleFunc(self.getInstance())
         if _is_null(sample):
             return None
-        return sample
+        if self.convert_to_str:
+            return SampleStructUsingStr(sample[0])
+        return sample[0]
 
     def GetEventOfCurrentSample(self):
         event = self._GetEventOfCurrentSampleFunc(self.getInstance())
         assert(not _is_null(event))
-        return event
+        if self.convert_to_str:
+            return EventStructUsingStr(event[0])
+        return event[0]
 
     def GetSymbolOfCurrentSample(self):
         symbol = self._GetSymbolOfCurrentSampleFunc(self.getInstance())
         assert(not _is_null(symbol))
-        return symbol
+        if self.convert_to_str:
+            return SymbolStructUsingStr(symbol[0])
+        return symbol[0]
 
     def GetCallChainOfCurrentSample(self):
         callchain = self._GetCallChainOfCurrentSampleFunc(self.getInstance())
         assert(not _is_null(callchain))
-        return callchain
+        if self.convert_to_str:
+            return CallChainStructureUsingStr(callchain[0])
+        return callchain[0]
+
+    def GetBuildIdForPath(self, path):
+        build_id = self._GetBuildIdForPathFunc(self.getInstance(), _char_pt(path))
+        assert(not _is_null(build_id))
+        return _char_pt_to_str(build_id)
 
     def getInstance(self):
         if self._instance is None:
@@ -183,3 +238,68 @@ class ReportLib(object):
     def _check(self, cond, failmsg):
         if not cond:
             raise Exception(failmsg)
+
+
+class TestReportLib(unittest.TestCase):
+    def setUp(self):
+        self.perf_data_path = os.path.join(os.path.dirname(get_script_dir()),
+                                           'testdata', 'perf_with_symbols.data')
+        if not os.path.isfile(self.perf_data_path):
+            raise Exception("can't find perf_data at %s" % self.perf_data_path)
+        self.report_lib = ReportLib()
+        self.report_lib.SetRecordFile(self.perf_data_path)
+
+    def tearDown(self):
+        self.report_lib.Close()
+
+    def test_build_id(self):
+        build_id = self.report_lib.GetBuildIdForPath('/data/t2')
+        self.assertEqual(build_id, '0x70f1fe24500fc8b0d9eb477199ca1ca21acca4de')
+
+    def test_symbol_addr(self):
+        found_func2 = False
+        while True:
+            sample = self.report_lib.GetNextSample()
+            if sample is None:
+                break
+            symbol = self.report_lib.GetSymbolOfCurrentSample()
+            if symbol.symbol_name == 'func2(int, int)':
+                found_func2 = True
+                self.assertEqual(symbol.symbol_addr, 0x4004ed)
+        self.assertTrue(found_func2)
+
+    def test_sample(self):
+        found_sample = False
+        while True:
+            sample = self.report_lib.GetNextSample()
+            if sample is None:
+                break
+            if sample.ip == 0x4004ff and sample.time == 7637889424953:
+                found_sample = True
+                self.assertEqual(sample.pid, 15926)
+                self.assertEqual(sample.tid, 15926)
+                self.assertEqual(sample.thread_comm, 't2')
+                self.assertEqual(sample.cpu, 5)
+                self.assertEqual(sample.period, 694614)
+                event = self.report_lib.GetEventOfCurrentSample()
+                self.assertEqual(event.name, 'cpu-cycles')
+                callchain = self.report_lib.GetCallChainOfCurrentSample()
+                self.assertEqual(callchain.nr, 0)
+        self.assertTrue(found_sample)
+
+
+def main():
+    test_all = True
+    if len(sys.argv) > 1 and sys.argv[1] == '--test-one':
+        test_all = False
+        del sys.argv[1]
+
+    if test_all:
+        subprocess.check_call(['python', os.path.realpath(__file__), '--test-one'])
+        subprocess.check_call(['python3', os.path.realpath(__file__), '--test-one'])
+    else:
+        sys.exit(unittest.main())
+
+
+if __name__ == '__main__':
+    main()

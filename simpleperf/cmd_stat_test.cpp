@@ -19,6 +19,9 @@
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
 #include <android-base/test_utils.h>
+#include <sys/syscall.h>
+
+#include <thread>
 
 #include "command.h"
 #include "get_test_data.h"
@@ -55,9 +58,15 @@ TEST(stat_cmd, event_modifier) {
 void CreateProcesses(size_t count,
                      std::vector<std::unique_ptr<Workload>>* workloads) {
   workloads->clear();
+  // Create workloads run longer than profiling time.
+  auto function = []() {
+    while (true) {
+      for (volatile int i = 0; i < 10000; ++i);
+      usleep(1);
+    }
+  };
   for (size_t i = 0; i < count; ++i) {
-    // Create a workload runs longer than profiling time.
-    auto workload = Workload::CreateWorkload({"sleep", "1000"});
+    auto workload = Workload::CreateWorkload(function);
     ASSERT_TRUE(workload != nullptr);
     ASSERT_TRUE(workload->Start());
     workloads->push_back(std::move(workload));
@@ -136,4 +145,24 @@ TEST(stat_cmd, no_modifier_for_clock_events) {
           << "event " << e << ":" << m;
     }
   }
+}
+
+TEST(stat_cmd, handle_SIGHUP) {
+  std::thread thread([]() {
+    sleep(1);
+    kill(getpid(), SIGHUP);
+  });
+  thread.detach();
+  ASSERT_TRUE(StatCmd()->Run({"sleep", "1000000"}));
+}
+
+TEST(stat_cmd, stop_when_no_more_targets) {
+  std::atomic<int> tid(0);
+  std::thread thread([&]() {
+    tid = syscall(__NR_gettid);
+    sleep(1);
+  });
+  thread.detach();
+  while (tid == 0);
+  ASSERT_TRUE(StatCmd()->Run({"-t", std::to_string(tid)}));
 }
