@@ -50,7 +50,38 @@ static void reset_f2fs_info() {
 	// Reset all the global data structures used by make_f2fs so it
 	// can be called again.
 	memset(&config, 0, sizeof(config));
-	config.fd = -1;
+
+	config.ndevs = 1;
+	config.total_sectors = 0;
+	config.sector_size = 0;
+	config.sectors_per_blk = DEFAULT_SECTORS_PER_BLOCK;
+	config.blks_per_seg = DEFAULT_BLOCKS_PER_SEGMENT;
+	config.wanted_total_sectors = -1;
+	config.zoned_mode = 0;
+	config.zoned_model = 0;
+	config.zone_blocks = 0;
+
+	for (int i = 0; i < MAX_DEVICES; i++) {
+		memset(&config.devices[i], 0, sizeof(struct device_info));
+		config.devices[i].fd = -1;
+		config.devices[i].sector_size = DEFAULT_SECTOR_SIZE;
+		config.devices[i].end_blkaddr = -1;
+		config.devices[i].zoned_model = F2FS_ZONED_NONE;
+	}
+
+	/* calculated by overprovision ratio */
+	config.reserved_segments = 0;
+	config.overprovision = 0;
+	config.segs_per_sec = 1;
+	config.secs_per_zone = 1;
+	config.segs_per_zone = 1;
+	config.heap = 1;
+	config.vol_label = "";
+	config.trim = 1;
+	config.ro = 0;
+	config.kd = -1;
+	config.bytes_reserved = 0;
+
 	if (f2fs_sparse_file) {
 		sparse_file_destroy(f2fs_sparse_file);
 		f2fs_sparse_file = NULL;
@@ -64,7 +95,7 @@ int make_f2fs_sparse_fd(int fd, long long len,
 		return -1;
 	}
 	reset_f2fs_info();
-	f2fs_init_configuration(&config);
+	f2fs_init_configuration();
 	len &= ~((__u64)(F2FS_BLKSIZE - 1));
 	config.total_sectors = len / config.sector_size;
 	config.start_sector = 0;
