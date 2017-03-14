@@ -324,8 +324,11 @@ TEST_F(ReportCommandTest, report_symbols_of_nativelib_in_apk) {
 TEST_F(ReportCommandTest, report_more_than_one_event_types) {
   Report(PERF_DATA_WITH_TWO_EVENT_TYPES);
   ASSERT_TRUE(success);
-  ASSERT_NE(content.find("cpu-cycles"), std::string::npos);
-  ASSERT_NE(content.find("cpu-clock"), std::string::npos);
+  size_t pos = 0;
+  ASSERT_NE(pos = content.find("cpu-cycles", pos), std::string::npos);
+  ASSERT_NE(pos = content.find("Samples:", pos), std::string::npos);
+  ASSERT_NE(pos = content.find("cpu-clock", pos), std::string::npos);
+  ASSERT_NE(pos = content.find("Samples:", pos), std::string::npos);
 }
 
 TEST_F(ReportCommandTest, report_kernel_symbol) {
@@ -452,6 +455,13 @@ TEST_F(ReportCommandTest, kallsyms_option) {
 
 TEST_F(ReportCommandTest, invalid_perf_data) {
   ASSERT_FALSE(ReportCmd()->Run({"-i", GetTestData(INVALID_PERF_DATA)}));
+}
+
+TEST_F(ReportCommandTest, raw_period_option) {
+  Report(PERF_DATA, {"--raw-period"});
+  ASSERT_TRUE(success);
+  ASSERT_NE(content.find("GlobalFunc"), std::string::npos);
+  ASSERT_EQ(content.find("%"), std::string::npos);
 }
 
 #if defined(__linux__)
