@@ -83,7 +83,7 @@ struct selabel_handle;
 
 #endif
 
-struct f2fs_configuration config;
+extern struct f2fs_configuration *cp;
 struct sparse_file *f2fs_sparse_file;
 
 struct buf_item {
@@ -99,12 +99,12 @@ static int __get_device_fd(__u64 *offset)
 	__u64 blk_addr = *offset >> F2FS_BLKSIZE_BITS;
 	int i;
 
-	for (i = 0; i < config.ndevs; i++) {
-		if (config.devices[i].start_blkaddr <= blk_addr &&
-				config.devices[i].end_blkaddr >= blk_addr) {
+	for (i = 0; i < cp->ndevs; i++) {
+		if (cp->devices[i].start_blkaddr <= blk_addr &&
+				cp->devices[i].end_blkaddr >= blk_addr) {
 			*offset -=
-				config.devices[i].start_blkaddr << F2FS_BLKSIZE_BITS;
-			return config.devices[i].fd;
+				cp->devices[i].start_blkaddr << F2FS_BLKSIZE_BITS;
+			return cp->devices[i].fd;
 		}
 	}
 	return -1;
