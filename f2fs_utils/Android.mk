@@ -35,20 +35,6 @@ LOCAL_MODULE := libf2fs_dlutils_host
 include $(BUILD_HOST_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := make_f2fs_main.c
-LOCAL_MODULE := make_f2fs
-# libf2fs_dlutils_host will dlopen("libf2fs_fmt_host_dyn")
-LOCAL_LDFLAGS := -ldl -rdynamic
-# The following libf2fs_* are from system/extras/f2fs_utils,
-# and do not use code in external/f2fs-tools.
-LOCAL_STATIC_LIBRARIES := libf2fs_utils_host libf2fs_ioutils_host libf2fs_dlutils_host
-LOCAL_REQUIRED_MODULES := libf2fs_fmt_host_dyn
-LOCAL_STATIC_LIBRARIES += \
-    libsparse_host \
-    libz
-include $(BUILD_HOST_EXECUTABLE)
-
-include $(CLEAR_VARS)
 LOCAL_MODULE := libf2fs_dlutils
 LOCAL_SRC_FILES := f2fs_dlutils.c
 LOCAL_C_INCLUDES := external/f2fs-tools/include external/f2fs-tools/mkfs
