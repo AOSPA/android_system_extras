@@ -29,6 +29,7 @@
 #include <android-base/parsedouble.h>
 #include <android-base/parseint.h>
 #include <android-base/strings.h>
+#include <android-base/test_utils.h>
 
 #include "command.h"
 #include "dwarf_unwind.h"
@@ -75,6 +76,7 @@ class RecordCommand : public Command {
 "Usage: simpleperf record [options] [command [command-args]]\n"
 "       Gather sampling information of running [command]. And -a/-p/-t option\n"
 "       can be used to change target of sampling information.\n"
+"       The default options are: -e cpu-cycles -f 4000 -o perf.data.\n"
 "-a     System-wide collection.\n"
 "-b     Enable take branch stack sampling. Same as '-j any'\n"
 "-c count     Set event sample period. It means recording one sample when\n"
@@ -87,9 +89,6 @@ class RecordCommand : public Command {
 "--cpu cpu_item1,cpu_item2,...\n"
 "             Collect samples only on the selected cpus. cpu_item can be cpu\n"
 "             number like 1, or cpu range like 0-3.\n"
-"--dump-symbols  Dump symbols in perf.data. By default perf.data doesn't contain\n"
-"                symbol information for samples. This option is used when there\n"
-"                is no symbol information in report environment.\n"
 "--duration time_in_sec  Monitor for time_in_sec seconds instead of running\n"
 "                        [command]. Here time_in_sec may be any positive\n"
 "                        floating point number.\n"
@@ -126,6 +125,9 @@ class RecordCommand : public Command {
 "                possible value <= 1024 will be used.\n"
 "--no-dump-kernel-symbols  Don't dump kernel symbols in perf.data. By default\n"
 "                          kernel symbols will be dumped when needed.\n"
+"--no-dump-symbols       Don't dump symbols in perf.data. By default symbols are\n"
+"                        dumped in perf.data, to support reporting in another\n"
+"                        environment.\n"
 "--no-inherit  Don't record created child threads/processes.\n"
 "--no-unwind   If `--call-graph dwarf` option is used, then the user's stack\n"
 "              will be unwound by default. Use this option to disable the\n"
@@ -137,9 +139,11 @@ class RecordCommand : public Command {
 "               will be unwound while recording by default. But it may lose\n"
 "               records as stacking unwinding can be time consuming. Use this\n"
 "               option to unwind the user's stack after recording.\n"
+"--start_profiling_fd fd_no    After starting profiling, write \"STARTED\" to\n"
+"                              <fd_no>, then close <fd_no>.\n"
 "--symfs <dir>    Look for files with symbols relative to this directory.\n"
 "                 This option is used to provide files with symbol table and\n"
-"                 debug information, which are used by --dump-symbols and -g.\n"
+"                 debug information, which are used for unwinding and dumping symbols.\n"
 "-t tid1,tid2,... Record events on existing threads. Mutually exclusive with -a.\n"
             // clang-format on
             ),
@@ -157,13 +161,14 @@ class RecordCommand : public Command {
         child_inherit_(true),
         duration_in_sec_(0),
         can_dump_kernel_symbols_(true),
-        dump_symbols_(false),
+        dump_symbols_(true),
         event_selection_set_(false),
         mmap_page_range_(std::make_pair(1, DESIRED_PAGES_IN_MAPPED_BUFFER)),
         record_filename_("perf.data"),
         start_sampling_time_in_ns_(0),
         sample_record_count_(0),
-        lost_record_count_(0) {
+        lost_record_count_(0),
+        start_profiling_fd_(-1) {
     // Stop profiling if parent exits.
     prctl(PR_SET_PDEATHSIG, SIGHUP, 0, 0, 0);
   }
@@ -219,15 +224,18 @@ class RecordCommand : public Command {
 
   uint64_t sample_record_count_;
   uint64_t lost_record_count_;
+  int start_profiling_fd_;
 };
 
 bool RecordCommand::Run(const std::vector<std::string>& args) {
+  // 0. Do some environment preparation.
   if (!CheckPerfEventLimit()) {
     return false;
   }
   if (!InitPerfClock()) {
     return false;
   }
+  PrepareVdsoFile();
 
   // 1. Parse options, and use default measured event type if not given.
   std::vector<std::string> workload_args;
@@ -320,6 +328,12 @@ bool RecordCommand::Run(const std::vector<std::string>& args) {
                << " ns";
   if (workload != nullptr && !workload->IsStarted() && !workload->Start()) {
     return false;
+  }
+  if (start_profiling_fd_ != -1) {
+    if (!android::base::WriteStringToFd("STARTED", start_profiling_fd_)) {
+      PLOG(ERROR) << "failed to write to start_profiling_fd_";
+    }
+    close(start_profiling_fd_);
   }
   if (!loop->RunLoop()) {
     return false;
@@ -421,8 +435,6 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
         return false;
       }
       cpus_ = GetCpusFromString(args[i]);
-    } else if (args[i] == "--dump-symbols") {
-      dump_symbols_ = true;
     } else if (args[i] == "--duration") {
       if (!NextArgumentOrError(args, &i)) {
         return false;
@@ -492,6 +504,8 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
       mmap_page_range_.first = mmap_page_range_.second = pages;
     } else if (args[i] == "--no-dump-kernel-symbols") {
       can_dump_kernel_symbols_ = false;
+    } else if (args[i] == "--no-dump-symbols") {
+      dump_symbols_ = false;
     } else if (args[i] == "--no-inherit") {
       child_inherit_ = false;
     } else if (args[i] == "--no-unwind") {
@@ -512,6 +526,14 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
       event_selection_set_.AddMonitoredProcesses(pids);
     } else if (args[i] == "--post-unwind") {
       post_unwind_ = true;
+    } else if (args[i] == "--start_profiling_fd") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      if (!android::base::ParseInt(args[i].c_str(), &start_profiling_fd_, 0)) {
+        LOG(ERROR) << "Invalid start_profiling_fd: " << args[i];
+        return false;
+      }
     } else if (args[i] == "--symfs") {
       if (!NextArgumentOrError(args, &i)) {
         return false;
@@ -556,6 +578,13 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
     if (!unwind_dwarf_callchain_) {
       LOG(ERROR) << "--post-unwind can't be used with `--no-unwind` option.";
       return false;
+    }
+  }
+
+  if (fp_callchain_sampling_) {
+    if (GetBuildArch() == ARCH_ARM) {
+      LOG(WARNING) << "`--callgraph fp` option doesn't work well on arm architecture, "
+                   << "consider using `-g` option or profiling on aarch64 architecture.";
     }
   }
 
@@ -905,7 +934,9 @@ bool RecordCommand::DumpAdditionalFeatures(
     const std::vector<std::string>& args) {
   // Read data section of perf.data to collect hit file information.
   thread_tree_.ClearThreadAndMap();
-  Dso::ReadKernelSymbolsFromProc();
+  if (CheckKernelSymbolAddresses()) {
+    Dso::ReadKernelSymbolsFromProc();
+  }
   auto callback = [&](const Record* r) {
     thread_tree_.Update(*r);
     if (r->type() == PERF_RECORD_SAMPLE) {
@@ -916,7 +947,7 @@ bool RecordCommand::DumpAdditionalFeatures(
     return false;
   }
 
-  size_t feature_count = 4;
+  size_t feature_count = 5;
   if (branch_sampling_) {
     feature_count++;
   }
@@ -959,6 +990,13 @@ bool RecordCommand::DumpAdditionalFeatures(
       !record_file_writer_->WriteBranchStackFeature()) {
     return false;
   }
+
+  std::unordered_map<std::string, std::string> info_map;
+  info_map["simpleperf_version"] = GetSimpleperfVersion();
+  if (!record_file_writer_->WriteMetaInfoFeature(info_map)) {
+    return false;
+  }
+
   if (!record_file_writer_->EndWriteFeatures()) {
     return false;
   }

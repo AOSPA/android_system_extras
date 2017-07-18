@@ -31,7 +31,6 @@ import os.path
 import profile_pb2
 import re
 import shutil
-import subprocess
 import sys
 import time
 
@@ -257,7 +256,10 @@ class PprofProfileGenerator(object):
         self.lib = ReportLib()
 
         if config.get('binary_cache_dir'):
-            self.lib.SetSymfs(config['binary_cache_dir'])
+            if not os.path.isdir(config.get('binary_cache_dir')):
+                config['binary_cache_dir'] = ''
+            else:
+                self.lib.SetSymfs(config['binary_cache_dir'])
         if config.get('record_file'):
             self.lib.SetRecordFile(config['record_file'])
         if config.get('kallsyms'):
@@ -316,7 +318,8 @@ class PprofProfileGenerator(object):
                 self.add_sample(sample)
 
         # 2. Generate line info for locations and functions.
-        self.gen_source_lines()
+        if self.config.get('binary_cache_dir'):
+            self.gen_source_lines()
 
         # 3. Produce samples/locations/functions in profile
         for sample in self.sample_list:
@@ -379,11 +382,14 @@ class PprofProfileGenerator(object):
     def get_location_id(self, ip, symbol):
         mapping_id = self.get_mapping_id(symbol.mapping[0], symbol.dso_name)
         location = Location(mapping_id, ip, symbol.vaddr_in_file)
-        # Default line info only contains the function name
-        line = Line()
-        line.function_id = self.get_function_id(symbol.symbol_name, symbol.dso_name,
-                                                symbol.symbol_addr)
-        location.lines.append(line)
+        function_id = self.get_function_id(symbol.symbol_name, symbol.dso_name,
+                                           symbol.symbol_addr)
+        if function_id:
+            # Add Line only when it has a valid function id, see http://b/36988814.
+            # Default line info only contains the function name
+            line = Line()
+            line.function_id = function_id
+            location.lines.append(line)
 
         exist_location = self.location_map.get(location.key)
         if exist_location:
@@ -462,10 +468,13 @@ class PprofProfileGenerator(object):
             source_id = 0
             for source in sources:
                 if source.file and source.function and source.line:
+                    function_id = self.get_function_id(source.function, dso_name, 0)
+                    if function_id == 0:
+                        continue
                     if source_id == 0:
                         # Clear default line info
                         location.lines = []
-                    location.lines.append(self.add_line(source, dso_name))
+                    location.lines.append(self.add_line(source, dso_name, function_id))
                     source_id += 1
 
         for function in self.function_list:
@@ -478,9 +487,8 @@ class PprofProfileGenerator(object):
                     if source.line:
                         function.start_line = source.line
 
-    def add_line(self, source, dso_name):
+    def add_line(self, source, dso_name, function_id):
         line = Line()
-        function_id = self.get_function_id(source.function, dso_name, 0)
         function = self.get_function(function_id)
         function.source_filename_id = self.get_string_id(source.file)
         line.function_id = function_id
@@ -506,8 +514,12 @@ class PprofProfileGenerator(object):
         profile_mapping.build_id = mapping.build_id_id
         profile_mapping.has_filenames = True
         profile_mapping.has_functions = True
-        profile_mapping.has_line_numbers = True
-        profile_mapping.has_inline_frames = True
+        if self.config.get('binary_cache_dir'):
+            profile_mapping.has_line_numbers = True
+            profile_mapping.has_inline_frames = True
+        else:
+            profile_mapping.has_line_numbers = False
+            profile_mapping.has_inline_frames = False
 
     def gen_profile_location(self, location):
         profile_location = self.profile.location.add()

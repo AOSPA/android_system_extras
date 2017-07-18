@@ -16,6 +16,9 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
+#include <android-base/file.h>
 #include <android-base/stringprintf.h>
 #include <android-base/test_utils.h>
 
@@ -136,6 +139,18 @@ TEST(record_cmd, fp_callchain_sampling) {
   ASSERT_TRUE(RunRecordCmd({"--call-graph", "fp"}));
 }
 
+TEST(record_cmd, fp_callchain_sampling_warning_on_arm) {
+  if (GetBuildArch() != ARCH_ARM) {
+    GTEST_LOG_(INFO) << "This test does nothing as it only tests on arm arch.";
+    return;
+  }
+  ASSERT_EXIT(
+      {
+        exit(RunRecordCmd({"--call-graph", "fp"}) ? 0 : 1);
+      },
+      testing::ExitedWithCode(0), "doesn't work well on arm");
+}
+
 TEST(record_cmd, system_wide_fp_callchain_sampling) {
   TEST_IN_ROOT(ASSERT_TRUE(RunRecordCmd({"-a", "--call-graph", "fp"})));
 }
@@ -239,11 +254,11 @@ static void CheckKernelSymbol(const std::string& path, bool need_kallsyms,
 
 TEST(record_cmd, kernel_symbol) {
   TemporaryFile tmpfile;
-  ASSERT_TRUE(RunRecordCmd({}, tmpfile.path));
+  ASSERT_TRUE(RunRecordCmd({"--no-dump-symbols"}, tmpfile.path));
   bool success;
   CheckKernelSymbol(tmpfile.path, true, &success);
   ASSERT_TRUE(success);
-  ASSERT_TRUE(RunRecordCmd({"--no-dump-kernel-symbols"}, tmpfile.path));
+  ASSERT_TRUE(RunRecordCmd({"--no-dump-symbols", "--no-dump-kernel-symbols"}, tmpfile.path));
   CheckKernelSymbol(tmpfile.path, false, &success);
   ASSERT_TRUE(success);
 }
@@ -288,14 +303,14 @@ static void CheckDsoSymbolRecords(const std::string& path,
   *success = true;
 }
 
-TEST(record_cmd, dump_symbols) {
+TEST(record_cmd, no_dump_symbols) {
   TemporaryFile tmpfile;
   ASSERT_TRUE(RunRecordCmd({}, tmpfile.path));
   bool success;
-  CheckDsoSymbolRecords(tmpfile.path, false, &success);
-  ASSERT_TRUE(success);
-  ASSERT_TRUE(RunRecordCmd({"--dump-symbols"}, tmpfile.path));
   CheckDsoSymbolRecords(tmpfile.path, true, &success);
+  ASSERT_TRUE(success);
+  ASSERT_TRUE(RunRecordCmd({"--no-dump-symbols"}, tmpfile.path));
+  CheckDsoSymbolRecords(tmpfile.path, false, &success);
   ASSERT_TRUE(success);
   if (IsDwarfCallChainSamplingSupported()) {
     std::vector<std::unique_ptr<Workload>> workloads;
@@ -303,10 +318,10 @@ TEST(record_cmd, dump_symbols) {
     std::string pid = std::to_string(workloads[0]->GetPid());
     ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g"}, tmpfile.path));
     bool success;
-    CheckDsoSymbolRecords(tmpfile.path, false, &success);
-    ASSERT_TRUE(success);
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g", "--dump-symbols"}, tmpfile.path));
     CheckDsoSymbolRecords(tmpfile.path, true, &success);
+    ASSERT_TRUE(success);
+    ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g", "--no-dump-symbols"}, tmpfile.path));
+    CheckDsoSymbolRecords(tmpfile.path, false, &success);
     ASSERT_TRUE(success);
   }
 }
@@ -316,9 +331,8 @@ TEST(record_cmd, dump_kernel_symbols) {
     GTEST_LOG_(INFO) << "Test requires root privilege";
     return;
   }
-  system("echo 0 >/proc/sys/kernel/kptr_restrict");
   TemporaryFile tmpfile;
-  ASSERT_TRUE(RunRecordCmd({"--dump-symbols", "-a", "-o", tmpfile.path, "sleep", "1"}));
+  ASSERT_TRUE(RunRecordCmd({"-a", "-o", tmpfile.path, "sleep", "1"}));
   std::unique_ptr<RecordFileReader> reader = RecordFileReader::CreateInstance(tmpfile.path);
   ASSERT_TRUE(reader != nullptr);
   std::map<int, SectionDesc> section_map = reader->FeatureSectionDescriptors();
@@ -394,4 +408,32 @@ TEST(record_cmd, donot_stop_when_having_targets) {
   ASSERT_TRUE(RecordCmd()->Run({"-o", tmpfile.path, "-p", pid, "--duration", "3"}));
   uint64_t end_time_in_ns = GetSystemClock();
   ASSERT_GT(end_time_in_ns - start_time_in_ns, static_cast<uint64_t>(2e9));
+}
+
+TEST(record_cmd, start_profiling_fd_option) {
+  int pipefd[2];
+  ASSERT_EQ(0, pipe(pipefd));
+  int read_fd = pipefd[0];
+  int write_fd = pipefd[1];
+  ASSERT_EXIT(
+      {
+        close(read_fd);
+        exit(RunRecordCmd({"--start_profiling_fd", std::to_string(write_fd)}) ? 0 : 1);
+      },
+      testing::ExitedWithCode(0), "");
+  close(write_fd);
+  std::string s;
+  ASSERT_TRUE(android::base::ReadFdToString(read_fd, &s));
+  close(read_fd);
+  ASSERT_EQ("STARTED", s);
+}
+
+TEST(record_cmd, record_meta_info_feature) {
+  TemporaryFile tmpfile;
+  ASSERT_TRUE(RunRecordCmd({}, tmpfile.path));
+  std::unique_ptr<RecordFileReader> reader = RecordFileReader::CreateInstance(tmpfile.path);
+  ASSERT_TRUE(reader != nullptr);
+  std::unordered_map<std::string, std::string> info_map;
+  ASSERT_TRUE(reader->ReadMetaInfoFeature(&info_map));
+  ASSERT_NE(info_map.find("simpleperf_version"), info_map.end());
 }
