@@ -156,49 +156,33 @@ TEST(record_cmd, system_wide_fp_callchain_sampling) {
 }
 
 TEST(record_cmd, dwarf_callchain_sampling) {
-  if (IsDwarfCallChainSamplingSupported()) {
-    std::vector<std::unique_ptr<Workload>> workloads;
-    CreateProcesses(1, &workloads);
-    std::string pid = std::to_string(workloads[0]->GetPid());
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf"}));
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf,16384"}));
-    ASSERT_FALSE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf,65536"}));
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g"}));
-  } else {
-    GTEST_LOG_(INFO) << "This test does nothing as dwarf callchain sampling is "
-                        "not supported on this device.";
-  }
+  ASSERT_TRUE(IsDwarfCallChainSamplingSupported());
+  std::vector<std::unique_ptr<Workload>> workloads;
+  CreateProcesses(1, &workloads);
+  std::string pid = std::to_string(workloads[0]->GetPid());
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf"}));
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf,16384"}));
+  ASSERT_FALSE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf,65536"}));
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g"}));
 }
 
 TEST(record_cmd, system_wide_dwarf_callchain_sampling) {
-  if (IsDwarfCallChainSamplingSupported()) {
-    TEST_IN_ROOT(RunRecordCmd({"-a", "--call-graph", "dwarf"}));
-  } else {
-    GTEST_LOG_(INFO) << "This test does nothing as dwarf callchain sampling is "
-                        "not supported on this device.";
-  }
+  ASSERT_TRUE(IsDwarfCallChainSamplingSupported());
+  TEST_IN_ROOT(RunRecordCmd({"-a", "--call-graph", "dwarf"}));
 }
 
 TEST(record_cmd, no_unwind_option) {
-  if (IsDwarfCallChainSamplingSupported()) {
-    ASSERT_TRUE(RunRecordCmd({"--call-graph", "dwarf", "--no-unwind"}));
-  } else {
-    GTEST_LOG_(INFO) << "This test does nothing as dwarf callchain sampling is "
-                        "not supported on this device.";
-  }
+  ASSERT_TRUE(IsDwarfCallChainSamplingSupported());
+  ASSERT_TRUE(RunRecordCmd({"--call-graph", "dwarf", "--no-unwind"}));
   ASSERT_FALSE(RunRecordCmd({"--no-unwind"}));
 }
 
 TEST(record_cmd, post_unwind_option) {
-  if (IsDwarfCallChainSamplingSupported()) {
-    std::vector<std::unique_ptr<Workload>> workloads;
-    CreateProcesses(1, &workloads);
-    std::string pid = std::to_string(workloads[0]->GetPid());
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf", "--post-unwind"}));
-  } else {
-    GTEST_LOG_(INFO) << "This test does nothing as dwarf callchain sampling is "
-                        "not supported on this device.";
-  }
+  ASSERT_TRUE(IsDwarfCallChainSamplingSupported());
+  std::vector<std::unique_ptr<Workload>> workloads;
+  CreateProcesses(1, &workloads);
+  std::string pid = std::to_string(workloads[0]->GetPid());
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "--call-graph", "dwarf", "--post-unwind"}));
   ASSERT_FALSE(RunRecordCmd({"--post-unwind"}));
   ASSERT_FALSE(
       RunRecordCmd({"--call-graph", "dwarf", "--no-unwind", "--post-unwind"}));
@@ -312,18 +296,16 @@ TEST(record_cmd, no_dump_symbols) {
   ASSERT_TRUE(RunRecordCmd({"--no-dump-symbols"}, tmpfile.path));
   CheckDsoSymbolRecords(tmpfile.path, false, &success);
   ASSERT_TRUE(success);
-  if (IsDwarfCallChainSamplingSupported()) {
-    std::vector<std::unique_ptr<Workload>> workloads;
-    CreateProcesses(1, &workloads);
-    std::string pid = std::to_string(workloads[0]->GetPid());
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g"}, tmpfile.path));
-    bool success;
-    CheckDsoSymbolRecords(tmpfile.path, true, &success);
-    ASSERT_TRUE(success);
-    ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g", "--no-dump-symbols"}, tmpfile.path));
-    CheckDsoSymbolRecords(tmpfile.path, false, &success);
-    ASSERT_TRUE(success);
-  }
+  ASSERT_TRUE(IsDwarfCallChainSamplingSupported());
+  std::vector<std::unique_ptr<Workload>> workloads;
+  CreateProcesses(1, &workloads);
+  std::string pid = std::to_string(workloads[0]->GetPid());
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g"}, tmpfile.path));
+  CheckDsoSymbolRecords(tmpfile.path, true, &success);
+  ASSERT_TRUE(success);
+  ASSERT_TRUE(RunRecordCmd({"-p", pid, "-g", "--no-dump-symbols"}, tmpfile.path));
+  CheckDsoSymbolRecords(tmpfile.path, false, &success);
+  ASSERT_TRUE(success);
 }
 
 TEST(record_cmd, dump_kernel_symbols) {
@@ -363,7 +345,7 @@ TEST(record_cmd, symfs_option) { ASSERT_TRUE(RunRecordCmd({"--symfs", "/"})); }
 TEST(record_cmd, duration_option) {
   TemporaryFile tmpfile;
   ASSERT_TRUE(RecordCmd()->Run({"--duration", "1.2", "-p",
-                                std::to_string(getpid()), "-o", tmpfile.path}));
+                                std::to_string(getpid()), "-o", tmpfile.path, "--in-app"}));
   ASSERT_TRUE(
       RecordCmd()->Run({"--duration", "1", "-o", tmpfile.path, "sleep", "2"}));
 }
@@ -396,7 +378,7 @@ TEST(record_cmd, stop_when_no_more_targets) {
   });
   thread.detach();
   while (tid == 0);
-  ASSERT_TRUE(RecordCmd()->Run({"-o", tmpfile.path, "-t", std::to_string(tid)}));
+  ASSERT_TRUE(RecordCmd()->Run({"-o", tmpfile.path, "-t", std::to_string(tid), "--in-app"}));
 }
 
 TEST(record_cmd, donot_stop_when_having_targets) {
@@ -436,4 +418,45 @@ TEST(record_cmd, record_meta_info_feature) {
   std::unordered_map<std::string, std::string> info_map;
   ASSERT_TRUE(reader->ReadMetaInfoFeature(&info_map));
   ASSERT_NE(info_map.find("simpleperf_version"), info_map.end());
+}
+
+// See http://b/63135835.
+TEST(record_cmd, cpu_clock_for_a_long_time) {
+  std::vector<std::unique_ptr<Workload>> workloads;
+  CreateProcesses(1, &workloads);
+  std::string pid = std::to_string(workloads[0]->GetPid());
+  TemporaryFile tmpfile;
+  ASSERT_TRUE(RecordCmd()->Run(
+      {"-e", "cpu-clock", "-o", tmpfile.path, "-p", pid, "--duration", "3"}));
+}
+
+TEST(record_cmd, dump_regs_for_tracepoint_events) {
+  // Check if the kernel can dump registers for tracepoint events.
+  // If not, probably a kernel patch below is missing:
+  // "5b09a094f2 arm64: perf: Fix callchain parse error with kernel tracepoint events"
+  std::vector<std::unique_ptr<Workload>> workloads;
+  CreateProcesses(1, &workloads);
+  std::string pid = std::to_string(workloads[0]->GetPid());
+  TemporaryFile tmpfile;
+  ASSERT_TRUE(RecordCmd()->Run({"-o", tmpfile.path, "-p", pid, "-e", "sched:sched_switch",
+                                "-g", "--no-unwind", "--duration", "1"}));
+
+  // If the kernel patch is missing, all regs dumped in sample records are zero.
+  std::unique_ptr<RecordFileReader> reader = RecordFileReader::CreateInstance(tmpfile.path);
+  CHECK(reader != nullptr);
+  std::unique_ptr<Record> r;
+  bool regs_all_zero = true;
+  while (reader->ReadRecord(r) && r && regs_all_zero) {
+    if (r->type() != PERF_RECORD_SAMPLE) {
+      continue;
+    }
+    SampleRecord* s = static_cast<SampleRecord*>(r.get());
+    for (size_t i = 0; i < s->regs_user_data.reg_nr; ++i) {
+      if (s->regs_user_data.regs[i] != 0u) {
+        regs_all_zero = false;
+        break;
+      }
+    }
+  }
+  ASSERT_FALSE(regs_all_zero);
 }
