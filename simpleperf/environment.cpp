@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <sys/utsname.h>
 
 #include <limits>
@@ -486,7 +487,7 @@ void PrepareVdsoFile() {
   std::string s(vdso_map->len, '\0');
   memcpy(&s[0], reinterpret_cast<void*>(static_cast<uintptr_t>(vdso_map->start_addr)),
          vdso_map->len);
-  std::unique_ptr<TemporaryFile> tmpfile(new TemporaryFile);
+  std::unique_ptr<TemporaryFile> tmpfile = CreateTempFileUsedInRecording();
   if (!android::base::WriteStringToFile(s, tmpfile->path)) {
     return;
   }
@@ -611,7 +612,7 @@ bool RunInAppContext(const std::string& app_package_name, const std::string& cmd
   std::string output_basename = output_filepath.empty() ? "" :
                                     android::base::Basename(output_filepath);
   std::vector<std::string> new_args =
-      {"run-as", app_package_name, "./simpleperf", cmd, "--in-app"};
+      {"run-as", app_package_name, "./simpleperf", cmd, "--in-app", "--log", GetLogSeverityName()};
   if (need_tracepoint_events) {
     new_args.push_back("--tracepoint-events");
     new_args.push_back(tracepoint_file);
@@ -676,4 +677,37 @@ void SetDefaultAppPackageName(const std::string& package_name) {
 
 const std::string& GetDefaultAppPackageName() {
   return default_package_name;
+}
+
+void AllowMoreOpenedFiles() {
+  // On Android <= O, the hard limit is 4096, and the soft limit is 1024.
+  // On Android >= P, both the hard and soft limit are 32768.
+  rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+    limit.rlim_cur = limit.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &limit);
+  }
+}
+
+static std::string temp_dir_used_in_recording;
+void SetTempDirectoryUsedInRecording(const std::string& tmp_dir) {
+  temp_dir_used_in_recording = tmp_dir;
+}
+
+std::unique_ptr<TemporaryFile> CreateTempFileUsedInRecording() {
+  CHECK(!temp_dir_used_in_recording.empty());
+  return std::unique_ptr<TemporaryFile>(new TemporaryFile(temp_dir_used_in_recording));
+}
+
+bool SignalIsIgnored(int signo) {
+  struct sigaction act;
+  if (sigaction(signo, nullptr, &act) != 0) {
+    PLOG(FATAL) << "failed to query signal handler for signal " << signo;
+  }
+
+  if ((act.sa_flags & SA_SIGINFO)) {
+    return false;
+  }
+
+  return act.sa_handler == SIG_IGN;
 }

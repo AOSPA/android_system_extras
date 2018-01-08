@@ -108,15 +108,16 @@ libsimpleperf_src_files := \
   utils.cpp \
 
 libsimpleperf_src_files_linux := \
+  CallChainJoiner.cpp \
   cmd_list.cpp \
   cmd_record.cpp \
   cmd_stat.cpp \
-  dwarf_unwind.cpp \
   environment.cpp \
   event_fd.cpp \
   event_selection_set.cpp \
   InplaceSamplerClient.cpp \
   IOEventLoop.cpp \
+  OfflineUnwinder.cpp \
   perf_clock.cpp \
   record_file_writer.cpp \
   UnixSocket.cpp \
@@ -361,6 +362,7 @@ simpleperf_unit_test_src_files := \
   utils_test.cpp \
 
 simpleperf_unit_test_src_files_linux := \
+  CallChainJoiner_test.cpp \
   cmd_dumprecord_test.cpp \
   cmd_list_test.cpp \
   cmd_record_test.cpp \
@@ -512,7 +514,8 @@ SIMPLEPERF_SCRIPT_LIST := \
     $(call all-java-files-under,demo) \
     $(call all-named-files-under,*.kt,demo) \
     testdata/perf_with_symbols.data \
-    testdata/perf_with_trace_offcpu.data
+    testdata/perf_with_trace_offcpu.data \
+    testdata/perf_with_tracepoint_event.data
 
 SIMPLEPERF_SCRIPT_LIST := $(addprefix -f $(LOCAL_PATH)/,$(SIMPLEPERF_SCRIPT_LIST))
 

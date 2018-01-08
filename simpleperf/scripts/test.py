@@ -77,7 +77,8 @@ def build_testdata():
     if (not os.path.isdir(from_testdata_path) or not os.path.isdir(from_demo_path) or
         not from_script_testdata_path):
         return
-    copy_testdata_list = ['perf_with_symbols.data', 'perf_with_trace_offcpu.data']
+    copy_testdata_list = ['perf_with_symbols.data', 'perf_with_trace_offcpu.data',
+                          'perf_with_tracepoint_event.data']
     copy_demo_list = ['SimpleperfExamplePureJava', 'SimpleperfExampleWithNative',
                       'SimpleperfExampleOfKotlin']
 
@@ -323,7 +324,7 @@ class TestExampleBase(TestBase):
 
     def common_test_report_html(self):
         self.run_cmd(['report_html.py', '-h'])
-        self.run_app_profiler()
+        self.run_app_profiler(record_arg='-g -f 1000 --duration 3 -e task-clock:u')
         self.run_cmd(['report_html.py'])
         self.run_cmd(['report_html.py', '--add_source_code', '--source_dirs', 'testdata'])
         self.run_cmd(['report_html.py', '--add_disassembly'])
@@ -430,7 +431,10 @@ class TestExamplePureJava(TestExampleBase):
         remove(test_dir)
         os.mkdir(test_dir)
         os.chdir(test_dir)
-        self.run_cmd([inferno_script])
+        self.run_cmd(['python', os.path.join(saved_dir, 'app_profiler.py'),
+                      '--app', self.package_name, '-r', '-e task-clock:u -g --duration 3'])
+        self.check_exist(file="perf.data")
+        self.run_cmd([inferno_script, "-sc"])
         os.chdir(saved_dir)
         remove(test_dir)
 
@@ -840,7 +844,7 @@ class TestReportLib(unittest.TestCase):
         self.assertTrue("product_props" in meta_info)
 
     def test_event_name_from_meta_info(self):
-        self.report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_trace_offcpu.data'))
+        self.report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_tracepoint_event.data'))
         event_names = set()
         while self.report_lib.GetNextSample():
             event_names.add(self.report_lib.GetEventOfCurrentSample().name)
@@ -868,6 +872,7 @@ class TestReportLib(unittest.TestCase):
                 if callchain.entries[i].symbol.symbol_name == sleep_function_name:
                     sleep_function_period += sample.period
                     break
+            self.assertEqual(self.report_lib.GetEventOfCurrentSample().name, 'cpu-cycles')
         sleep_percentage = float(sleep_function_period) / total_period
         self.assertGreater(sleep_percentage, 0.30)
 
@@ -951,12 +956,11 @@ class TestTools(unittest.TestCase):
                 for line in source_str.split('\n'):
                     items = line.split(':')
                     expected_source.append((items[0].strip(), int(items[1])))
-                actual_source = dso.get_addr_source(test_addr['addr'])
+                actual_source = addr2line.get_addr_source(dso, test_addr['addr'])
                 self.assertTrue(actual_source is not None)
                 self.assertEqual(len(actual_source), len(expected_source))
                 for i in range(len(expected_source)):
-                    actual_file_id, actual_line = actual_source[i]
-                    actual_file_path = addr2line.get_file_path(actual_file_id)
+                    actual_file_path, actual_line = actual_source[i]
                     self.assertEqual(actual_file_path, expected_source[i][0])
                     self.assertEqual(actual_line, expected_source[i][1])
 

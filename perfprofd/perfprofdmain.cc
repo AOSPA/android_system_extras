@@ -15,9 +15,24 @@
 ** limitations under the License.
 */
 
-extern int perfprofd_main(int argc, char** argv);
+#include <string.h>
+
+#include "config.h"
+#include "perfprofd_binder.h"
+
+extern int perfprofd_main(int argc, char** argv, Config* config);
 
 int main(int argc, char** argv)
 {
-  return perfprofd_main(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "--binder") == 0) {
+    return android::perfprofd::binder::Main();
+  }
+
+  struct PosixSleepConfig : public Config {
+    void Sleep(size_t seconds) override {
+      sleep(seconds);
+    }
+  };
+  PosixSleepConfig config;
+  return perfprofd_main(argc, argv, &config);
 }

@@ -51,21 +51,45 @@ cc_library_static {
 }
 
 //
+// Static library with binder service.
+//
+cc_library_static {
+    name: "libperfprofd_binder",
+
+    export_include_dirs: ["."],
+    static_libs: [
+        "libbase",
+        "libbinder",
+    ],
+    srcs: [
+        "perfprofd_binder.cc",
+        ":perfprofd_aidl",
+    ],
+
+    cflags: perfprofd_cflags,
+    cppflags: perfprofd_cppflags,
+}
+
+//
 // Main daemon
 //
 cc_binary {
     name: "perfprofd",
 
-    srcs: ["perfprofdmain.cc"],
+    srcs: [
+        "perfprofdmain.cc",
+    ],
     static_libs: [
         "libperfprofdcore",
         "libperfprofdutils",
+        "libperfprofd_binder",
     ],
     shared_libs: [
         "liblog",
         "libprotobuf-cpp-lite",
         "libbase",
-        "libcutils"
+        "libbinder",
+        "libutils",
     ],
     system_shared_libs: [
         "libc", "libdl",
@@ -74,6 +98,13 @@ cc_binary {
     cppflags: perfprofd_cppflags,
 
     init_rc: ["perfprofd.rc"],
+}
+
+filegroup {
+    name: "perfprofd_aidl",
+    srcs: [
+        "binder/android/os/IPerfProfd.aidl",
+    ],
 }
 
 subdirs = ["tests"]

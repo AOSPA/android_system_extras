@@ -110,8 +110,7 @@ def parse_samples(process, args):
             break
         symbol = lib.GetSymbolOfCurrentSample()
         callchain = lib.GetCallChainOfCurrentSample()
-        process.get_thread(sample.tid, sample.pid).add_callchain(callchain, symbol, sample)
-        process.num_samples += 1
+        process.add_sample(sample, symbol, callchain)
 
     if process.pid == 0:
         main_threads = [thread for thread in process.threads.values() if thread.tid == thread.pid]
@@ -120,7 +119,7 @@ def parse_samples(process, args):
             process.pid = main_threads[0].pid
 
     for thread in process.threads.values():
-        min_event_count = thread.event_count * args.min_callchain_percentage * 0.01
+        min_event_count = thread.num_events * args.min_callchain_percentage * 0.01
         thread.flamegraph.trim_callchain(min_event_count)
 
     log_info("Parsed %s callchains." % process.num_samples)
@@ -160,16 +159,19 @@ def output_report(process, args):
                       ) if args.capture_duration else ""
     f.write("""<div style='display:inline-block;'>
                   <font size='8'>
-                  Inferno Flamegraph Report</font><br/><br/>
+                  Inferno Flamegraph Report%s</font><br/><br/>
                   %s
                   Date&nbsp;&nbsp;&nbsp;&nbsp;: %s<br/>
                   Threads : %d <br/>
                   Samples : %d</br>
+                  Event count: %d</br>
                   %s""" % (
+        (': ' + args.title) if args.title else '',
         process_entry,
         datetime.datetime.now().strftime("%Y-%m-%d (%A) %H:%M:%S"),
         len(process.threads),
         process.num_samples,
+        process.num_events,
         duration_entry))
     if 'ro.product.model' in process.props:
         f.write(
@@ -186,15 +188,8 @@ def output_report(process, args):
     if not args.embedded_flamegraph:
         f.write("<script>document.addEventListener('DOMContentLoaded', flamegraphInit);</script>")
 
-    # Output tid == pid Thread first.
-    main_thread = [x for x in process.threads.values() if x.tid == process.pid]
-    for thread in main_thread:
-        f.write("<br/><br/><b>Main Thread %d (%s) (%d samples):</b><br/>\n\n\n\n" % (
-                thread.tid, thread.name, thread.num_samples))
-        renderSVG(thread.flamegraph, f, args.color)
-
-    other_threads = [x for x in process.threads.values() if x.tid != process.pid]
-    for thread in other_threads:
+    # Sort threads by the event count in a thread.
+    for thread in sorted(process.threads.values(), key=lambda x: x.num_events, reverse=True):
         f.write("<br/><br/><b>Thread %d (%s) (%d samples):</b><br/>\n\n\n\n" % (
                 thread.tid, thread.name, thread.num_samples))
         renderSVG(thread.flamegraph, f, args.color)
@@ -254,6 +249,7 @@ def main():
                         e.g: "10000 cpu-cyles". A few examples of event_name: cpu-cycles,
                         cache-references, cache-misses, branch-instructions, branch-misses""",
                         default="")
+    parser.add_argument('--title', help='Show a title in the report.')
     parser.add_argument('--disable_adb_root', action='store_true', help="""Force adb to run in non
                         root mode.""")
     parser.add_argument('-o', '--report_path', default='report.html', help="Set report path.")

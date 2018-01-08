@@ -28,6 +28,8 @@
 #include <android-base/logging.h>
 
 #include "build_id.h"
+#include "CallChainJoiner.h"
+#include "OfflineUnwinder.h"
 #include "perf_event.h"
 
 enum user_record_type {
@@ -46,6 +48,8 @@ enum user_record_type {
   SIMPLE_PERF_RECORD_SPLIT,
   SIMPLE_PERF_RECORD_SPLIT_END,
   SIMPLE_PERF_RECORD_EVENT_ID,
+  SIMPLE_PERF_RECORD_CALLCHAIN,
+  SIMPLE_PERF_RECORD_UNWINDING_RESULT,
 };
 
 // perf_event_header uses u16 to store record size. However, that is not
@@ -389,6 +393,9 @@ struct SampleRecord : public Record {
 
   void ReplaceRegAndStackWithCallChain(const std::vector<uint64_t>& ips);
   size_t ExcludeKernelCallChain();
+  bool HasUserCallChain() const;
+  void UpdateUserCallChain(const std::vector<uint64_t>& user_ips);
+
   uint64_t Timestamp() const override;
   uint32_t Cpu() const override;
   uint64_t Id() const override;
@@ -489,6 +496,47 @@ struct EventIdRecord : public Record {
   explicit EventIdRecord(char* p);
 
   explicit EventIdRecord(const std::vector<uint64_t>& data);
+
+ protected:
+  void DumpData(size_t indent) const override;
+};
+
+struct CallChainRecord : public Record {
+  uint32_t pid;
+  uint32_t tid;
+  uint64_t chain_type;
+  uint64_t time;
+  uint64_t ip_nr;
+  uint64_t* ips;
+  uint64_t* sps;
+
+  explicit CallChainRecord(char* p);
+
+  CallChainRecord(pid_t pid, pid_t tid, simpleperf::CallChainJoiner::ChainType type, uint64_t time,
+                  const std::vector<uint64_t>& ips, const std::vector<uint64_t>& sps);
+
+  uint64_t Timestamp() const override {
+    return time;
+  }
+
+ protected:
+  void DumpData(size_t indent) const override;
+};
+
+struct UnwindingResultRecord : public Record {
+  uint64_t time;
+  uint64_t used_time;
+  uint64_t stop_reason;
+  uint64_t stop_info;
+
+  explicit UnwindingResultRecord(char* p);
+
+  UnwindingResultRecord(uint64_t time, uint64_t used_time, int stop_reason,
+                        uint64_t stop_info);
+
+  uint64_t Timestamp() const override {
+    return time;
+  }
 
  protected:
   void DumpData(size_t indent) const override;
