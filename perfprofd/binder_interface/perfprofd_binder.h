@@ -1,6 +1,6 @@
 /*
 **
-** Copyright 2015, The Android Open Source Project
+** Copyright 2017, The Android Open Source Project
 **
 ** Licensed under the Apache License, Version 2.0 (the "License");
 ** you may not use this file except in compliance with the License.
@@ -15,21 +15,17 @@
 ** limitations under the License.
 */
 
-#include <sys/cdefs.h>
+#ifndef SYSTEM_EXTRAS_PERFPROFD_BINDER_INTERFACE_PERFPROFD_BINDER_H_
+#define SYSTEM_EXTRAS_PERFPROFD_BINDER_INTERFACE_PERFPROFD_BINDER_H_
 
-__BEGIN_DECLS
+namespace android {
+namespace perfprofd {
+namespace binder {
 
-//
-// These routines are separated out from the core perfprofd so
-// as to be used as part of the unit test (see the README.txt
-// alongside the unit test for more info).
-//
-extern void perfprofd_log_error(const char *fmt, ...);
-extern void perfprofd_log_warning(const char *fmt, ...);
-extern void perfprofd_log_info(const char *fmt, ...);
+int Main();
 
-#define W_ALOGE perfprofd_log_error
-#define W_ALOGW perfprofd_log_warning
-#define W_ALOGI perfprofd_log_info
+}  // namespace binder
+}  // namespace perfprofd
+}  // namespace android
 
-__END_DECLS
+#endif  // SYSTEM_EXTRAS_PERFPROFD_BINDER_INTERFACE_PERFPROFD_BINDER_H_

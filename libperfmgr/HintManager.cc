@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "libperfmgr"
+
 #include <set>
 
 #include <android-base/file.h>
@@ -40,22 +42,20 @@ bool HintManager::ValidateHint(const std::string& hint_type) const {
 }
 
 bool HintManager::DoHint(const std::string& hint_type) {
-    std::lock_guard<std::mutex> lk(lock_);
     LOG(VERBOSE) << "Do Powerhint: " << hint_type;
     return ValidateHint(hint_type)
-               ? nm_->Request(actions_[hint_type], hint_type)
+               ? nm_->Request(actions_.at(hint_type), hint_type)
                : false;
 }
 
 bool HintManager::DoHint(const std::string& hint_type,
                          std::chrono::milliseconds timeout_ms_override) {
-    std::lock_guard<std::mutex> lk(lock_);
     LOG(VERBOSE) << "Do Powerhint: " << hint_type << " for "
                  << timeout_ms_override.count() << "ms";
     if (!ValidateHint(hint_type)) {
         return false;
     }
-    std::vector<NodeAction> actions_override = actions_[hint_type];
+    std::vector<NodeAction> actions_override = actions_.at(hint_type);
     for (auto& action : actions_override) {
         action.timeout_ms = timeout_ms_override;
     }
@@ -63,10 +63,10 @@ bool HintManager::DoHint(const std::string& hint_type,
 }
 
 bool HintManager::EndHint(const std::string& hint_type) {
-    std::lock_guard<std::mutex> lk(lock_);
     LOG(VERBOSE) << "End Powerhint: " << hint_type;
-    return ValidateHint(hint_type) ? nm_->Cancel(actions_[hint_type], hint_type)
-                                   : false;
+    return ValidateHint(hint_type)
+               ? nm_->Cancel(actions_.at(hint_type), hint_type)
+               : false;
 }
 
 bool HintManager::IsRunning() const {
@@ -297,6 +297,15 @@ std::map<std::string, std::vector<NodeAction>> HintManager::ParseActions(
                 {node_index, static_cast<std::size_t>(value_index),
                  std::chrono::milliseconds(duration)}};
         } else {
+            for (const auto& action : actions_parsed[hint_type]) {
+                if (action.node_index == node_index) {
+                    LOG(ERROR)
+                        << "Action[" << i
+                        << "]'s NodeIndex is duplicated with another Action";
+                    actions_parsed.clear();
+                    return actions_parsed;
+                }
+            }
             actions_parsed[hint_type].emplace_back(
                 node_index, static_cast<std::size_t>(value_index),
                 std::chrono::milliseconds(duration));
@@ -307,7 +316,7 @@ std::map<std::string, std::vector<NodeAction>> HintManager::ParseActions(
 
     LOG(INFO) << total_parsed << " Actions parsed successfully";
 
-    for (auto& action : actions_parsed) {
+    for (const auto& action : actions_parsed) {
         LOG(INFO) << "PowerHint " << action.first << " has "
                   << action.second.size() << " actions parsed";
     }

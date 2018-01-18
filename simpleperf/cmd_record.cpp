@@ -391,6 +391,7 @@ bool RecordCommand::PrepareRecording(Workload* workload) {
       // app process. In this way, we can have a better support of app start-up time profiling.
       std::set<pid_t> pids = WaitForAppProcesses(app_package_name_);
       event_selection_set_.AddMonitoredProcesses(pids);
+      need_to_check_targets = true;
     } else {
       LOG(ERROR)
           << "No threads to monitor. Try `simpleperf help record` for help";
@@ -1097,8 +1098,7 @@ bool RecordCommand::UnwindRecord(SampleRecord& r) {
     }
     if (offline_unwinder_->HasStat()) {
       const UnwindingResult& unwinding_result = offline_unwinder_->GetUnwindingResult();
-      UnwindingResultRecord record(r.time_data.time, unwinding_result.used_time,
-                                   unwinding_result.stop_reason, unwinding_result.stop_info.regno);
+      UnwindingResultRecord record(r.time_data.time, unwinding_result);
       if (!record_file_writer_->WriteRecord(record)) {
         return false;
       }

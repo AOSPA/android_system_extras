@@ -1,11 +1,31 @@
 
 #include "perf_data_converter.h"
-#include "quipper/perf_parser.h"
+
+#include <algorithm>
+#include <limits>
 #include <map>
+#include <unordered_map>
+
+#include <android-base/strings.h>
+
+#include "perf_profile.pb.h"
+
+#include "quipper/perf_parser.h"
+#include "symbolizer.h"
 
 using std::map;
 
 namespace wireless_android_logging_awp {
+
+// Flag to turn off symbolization, even if a symbolizer is given.
+static constexpr bool kUseSymbolizer = true;
+
+// If this flag is true, symbols will be computed on-device for all samples. If this
+// flag is false, this will only be done for modules without a build id (i.e., where
+// symbols cannot be derived in the cloud).
+//
+// This is turned off for now to conserve space.
+static constexpr bool kUseSymbolizerForModulesWithBuildId = false;
 
 typedef quipper::ParsedEvent::DSOAndOffset DSOAndOffset;
 typedef std::vector<DSOAndOffset> callchain;
@@ -54,13 +74,15 @@ struct BinaryProfile {
   map<const callchain *, uint64, callchain_lt> callchain_count_map;
 };
 
-wireless_android_play_playlog::AndroidPerfProfile
-RawPerfDataToAndroidPerfProfile(const string &perf_file) {
-  wireless_android_play_playlog::AndroidPerfProfile ret;
+wireless_android_play_playlog::AndroidPerfProfile*
+RawPerfDataToAndroidPerfProfile(const string &perf_file,
+                                ::perfprofd::Symbolizer* symbolizer) {
   quipper::PerfParser parser;
   if (!parser.ReadFile(perf_file) || !parser.ParseRawEvents()) {
-    return ret;
+    return nullptr;
   }
+  std::unique_ptr<wireless_android_play_playlog::AndroidPerfProfile> ret(
+      new wireless_android_play_playlog::AndroidPerfProfile());
 
   typedef map<string, BinaryProfile> ModuleProfileMap;
   typedef map<string, ModuleProfileMap> ProgramProfileMap;
@@ -74,6 +96,20 @@ RawPerfDataToAndroidPerfProfile(const string &perf_file) {
   uint64 total_samples = 0;
   bool seen_branch_stack = false;
   bool seen_callchain = false;
+
+  auto is_kernel_dso = [](const std::string& dso) {
+    constexpr const char* kKernelDsos[] = {
+        "[kernel.kallsyms]",
+        "[vdso]",
+    };
+    for (auto kernel_dso : kKernelDsos) {
+      if (dso == kernel_dso) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   for (const auto &event : parser.parsed_events()) {
     if (!event.raw_event ||
         event.raw_event->header.type != PERF_RECORD_SAMPLE) {
@@ -82,13 +118,17 @@ RawPerfDataToAndroidPerfProfile(const string &perf_file) {
     string dso_name = event.dso_and_offset.dso_name();
     string program_name = event.command();
     const string kernel_name = "[kernel.kallsyms]";
-    if (dso_name.substr(0, kernel_name.length()) == kernel_name) {
+    if (android::base::StartsWith(dso_name, kernel_name)) {
       dso_name = kernel_name;
       if (program_name == "") {
         program_name = "kernel";
       }
     } else if (program_name == "") {
-      program_name = "unknown_program";
+      if (is_kernel_dso(dso_name)) {
+        program_name = "kernel";
+      } else {
+        program_name = "unknown_program";
+      }
     }
     total_samples++;
     // We expect to see either all callchain events, all branch stack
@@ -126,25 +166,35 @@ RawPerfDataToAndroidPerfProfile(const string &perf_file) {
     }
   }
 
-  map<string, int> name_id_map;
+  struct ModuleData {
+    int index = 0;
+
+    std::vector<std::string> symbols;
+    std::unordered_map<uint64_t, size_t> addr_to_symbol_index;
+
+    wireless_android_play_playlog::LoadModule* module = nullptr;
+  };
+  map<string, ModuleData> name_data_map;
   for (const auto &program_profile : name_profile_map) {
     for (const auto &module_profile : program_profile.second) {
-      name_id_map[module_profile.first] = 0;
+      name_data_map[module_profile.first] = ModuleData();
     }
   }
   int current_index = 0;
-  for (auto iter = name_id_map.begin(); iter != name_id_map.end(); ++iter) {
-    iter->second = current_index++;
+  for (auto iter = name_data_map.begin(); iter != name_data_map.end(); ++iter) {
+    iter->second.index = current_index++;
   }
 
   map<string, string> name_buildid_map;
   parser.GetFilenamesToBuildIDs(&name_buildid_map);
-  ret.set_total_samples(total_samples);
-  for (const auto &name_id : name_id_map) {
-    auto load_module = ret.add_load_modules();
-    load_module->set_name(name_id.first);
-    auto nbmi = name_buildid_map.find(name_id.first);
-    if (nbmi != name_buildid_map.end()) {
+  ret->set_total_samples(total_samples);
+
+  for (auto& name_data : name_data_map) {
+    auto load_module = ret->add_load_modules();
+    load_module->set_name(name_data.first);
+    auto nbmi = name_buildid_map.find(name_data.first);
+    bool has_build_id = nbmi != name_buildid_map.end();
+    if (has_build_id) {
       const std::string &build_id = nbmi->second;
       if (build_id.size() == 40 && build_id.substr(32) == "00000000") {
         load_module->set_build_id(build_id.substr(0, 32));
@@ -152,17 +202,61 @@ RawPerfDataToAndroidPerfProfile(const string &perf_file) {
         load_module->set_build_id(build_id);
       }
     }
+    if (kUseSymbolizer && symbolizer != nullptr && !is_kernel_dso(name_data.first)) {
+      if (kUseSymbolizerForModulesWithBuildId || !has_build_id) {
+        // Add the module to signal that we'd want to add symbols.
+        name_data.second.module = load_module;
+      }
+    }
   }
+
+  auto symbolize = [symbolizer](ModuleData* module_data,
+                                const std::string& dso,
+                                uint64_t address) {
+    if (module_data->module == nullptr) {
+      return address;
+    }
+    auto it = module_data->addr_to_symbol_index.find(address);
+    size_t index = std::numeric_limits<size_t>::max();
+    if (it == module_data->addr_to_symbol_index.end()) {
+      std::string symbol = symbolizer->Decode(dso, address);
+      if (!symbol.empty()) {
+        // Deduplicate symbols.
+        auto it = std::find(module_data->symbols.begin(), module_data->symbols.end(), symbol);
+        if (it == module_data->symbols.end()) {
+          index = module_data->symbols.size();
+          module_data->symbols.push_back(symbol);
+        } else {
+          index = it - module_data->symbols.begin();
+        }
+        module_data->addr_to_symbol_index.emplace(address, index);
+      }
+    } else {
+      index = it->second;
+    }
+    if (index != std::numeric_limits<size_t>::max()) {
+      // Note: consider an actual entry in the proto? Maybe a oneof? But that
+          //       will be complicated with the separate repeated addr & module.
+      address = std::numeric_limits<size_t>::max() - index;
+    }
+    return address;
+  };
+
   for (const auto &program_profile : name_profile_map) {
-    auto program = ret.add_programs();
+    auto program = ret->add_programs();
     program->set_name(program_profile.first);
     for (const auto &module_profile : program_profile.second) {
-      int32 module_id = name_id_map[module_profile.first];
+      ModuleData& module_data = name_data_map[module_profile.first];
+      int32 module_id = module_data.index;
       auto module = program->add_modules();
       module->set_load_module_id(module_id);
+
+      // TODO: Templatize to avoid branch overhead?
       for (const auto &addr_count : module_profile.second.address_count_map) {
         auto address_samples = module->add_address_samples();
-        address_samples->add_address(addr_count.first);
+
+        uint64_t address = symbolize(&module_data, module_profile.first, addr_count.first);
+        address_samples->add_address(address);
         address_samples->set_count(addr_count.second);
       }
       for (const auto &range_count : module_profile.second.range_count_map) {
@@ -177,14 +271,25 @@ RawPerfDataToAndroidPerfProfile(const string &perf_file) {
         auto address_samples = module->add_address_samples();
         address_samples->set_count(callchain_count.second);
         for (const auto &d_o : *callchain_count.first) {
-          int32 module_id = name_id_map[d_o.dso_name()];
+          ModuleData& module_data = name_data_map[d_o.dso_name()];
+          int32 module_id = module_data.index;
           address_samples->add_load_module_id(module_id);
-          address_samples->add_address(d_o.offset());
+          address_samples->add_address(symbolize(&module_data, d_o.dso_name(), d_o.offset()));
         }
       }
     }
   }
-  return ret;
+
+  for (auto& name_data : name_data_map) {
+    auto load_module = name_data.second.module;
+    if (load_module != nullptr) {
+      for (const std::string& symbol : name_data.second.symbols) {
+        load_module->add_symbol(symbol);
+      }
+    }
+  }
+
+  return ret.release();
 }
 
 }  // namespace wireless_android_logging_awp

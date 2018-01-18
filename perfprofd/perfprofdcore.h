@@ -18,7 +18,18 @@
 #ifndef SYSTEM_EXTRAS_PERFPROFD_PERFPROFDCORE_H_
 #define SYSTEM_EXTRAS_PERFPROFD_PERFPROFDCORE_H_
 
+#include <functional>
+#include <memory>
+
 struct Config;
+
+namespace wireless_android_play_playlog {
+class AndroidPerfProfile;
+}
+
+namespace perfprofd {
+struct Symbolizer;
+}
 
 // Semaphore file that indicates that the user is opting in
 #define SEMAPHORE_FILENAME "perf_profile_collection_enabled.txt"
@@ -70,9 +81,16 @@ typedef enum {
 PROFILE_RESULT encode_to_proto(const std::string &data_file_path,
                                const char *encoded_file_path,
                                const Config& config,
-                               unsigned cpu_utilization);
+                               unsigned cpu_utilization,
+                               perfprofd::Symbolizer* symbolizer);
 
-void ProfilingLoop(Config& config);
+PROFILE_RESULT SerializeProtobuf(wireless_android_play_playlog::AndroidPerfProfile* encodedProfile,
+                                 const char* encoded_file_path);
+
+using HandlerFn = std::function<bool(wireless_android_play_playlog::AndroidPerfProfile* proto,
+                                     Config* config)>;
+
+void ProfilingLoop(Config& config, HandlerFn handler);
 
 //
 // Exposed for unit testing
