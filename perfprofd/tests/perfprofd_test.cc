@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 
@@ -33,6 +35,7 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/test_utils.h>
+#include <android-base/thread_annotations.h>
 #include <gtest/gtest.h>
 
 #include "config.h"
@@ -53,32 +56,37 @@ namespace {
 using android::base::LogId;
 using android::base::LogSeverity;
 
-static std::vector<std::string>* gTestLogMessages = nullptr;
+class TestLogHelper {
+ public:
+  void Install() {
+    using namespace std::placeholders;
+    android::base::SetLogger(
+        std::bind(&TestLogHelper::TestLogFunction, this, _1, _2, _3, _4, _5, _6));
+  }
 
-static void TestLogFunction(LogId log_id ATTRIBUTE_UNUSED,
-                            LogSeverity severity,
-                            const char* tag,
-                            const char* file ATTRIBUTE_UNUSED,
-                            unsigned int line ATTRIBUTE_UNUSED,
-                            const char* message) {
-  constexpr char log_characters[] = "VDIWEFF";
-  char severity_char = log_characters[severity];
-  gTestLogMessages->push_back(android::base::StringPrintf("%c: %s", severity_char, message));
-}
+  std::string JoinTestLog(const char* delimiter) {
+    std::unique_lock<std::mutex> ul(lock_);
+    return android::base::Join(test_log_messages_, delimiter);
+  }
 
-static void InitTestLog() {
-  CHECK(gTestLogMessages == nullptr);
-  gTestLogMessages = new std::vector<std::string>();
-}
-static void ClearTestLog() {
-  CHECK(gTestLogMessages != nullptr);
-  delete gTestLogMessages;
-  gTestLogMessages = nullptr;
-}
-static std::string JoinTestLog(const char* delimiter) {
-  CHECK(gTestLogMessages != nullptr);
-  return android::base::Join(*gTestLogMessages, delimiter);
-}
+ private:
+  void TestLogFunction(LogId log_id ATTRIBUTE_UNUSED,
+                       LogSeverity severity,
+                       const char* tag,
+                       const char* file ATTRIBUTE_UNUSED,
+                       unsigned int line ATTRIBUTE_UNUSED,
+                       const char* message) {
+    std::unique_lock<std::mutex> ul(lock_);
+    constexpr char log_characters[] = "VDIWEFF";
+    char severity_char = log_characters[severity];
+    test_log_messages_.push_back(android::base::StringPrintf("%c: %s", severity_char, message));
+  }
+
+ private:
+  std::mutex lock_;
+
+  std::vector<std::string> test_log_messages_;
+};
 
 }  // namespace
 
@@ -87,53 +95,6 @@ static std::string JoinTestLog(const char* delimiter) {
 
 // Temporary config file that we will emit for the daemon to read
 #define CONFIGFILE "perfprofd.conf"
-
-class PerfProfdTest : public testing::Test {
- protected:
-  virtual void SetUp() {
-    InitTestLog();
-    android::base::SetLogger(TestLogFunction);
-    create_dirs();
-  }
-
-  virtual void TearDown() {
-    android::base::SetLogger(android::base::StderrLogger);
-    ClearTestLog();
-
-    // TODO: proper management of test files. For now, use old system() code.
-    for (const auto dir : { &dest_dir, &conf_dir }) {
-      std::string cmd("rm -rf ");
-      cmd += *dir;
-      int ret = system(cmd.c_str());
-      CHECK_EQ(0, ret);
-    }
-  }
-
- protected:
-  // test_dir is the directory containing the test executable and
-  // any files associated with the test (will be created by the harness).
-  std::string test_dir;
-
-  // dest_dir is a temporary directory that we're using as the destination directory.
-  // It is backed by temp_dir1.
-  std::string dest_dir;
-
-  // conf_dir is a temporary directory that we're using as the configuration directory.
-  // It is backed by temp_dir2.
-  std::string conf_dir;
-
- private:
-  void create_dirs() {
-    temp_dir1.reset(new TemporaryDir());
-    temp_dir2.reset(new TemporaryDir());
-    dest_dir = temp_dir1->path;
-    conf_dir = temp_dir2->path;
-    test_dir = android::base::Dirname(gExecutableRealpath);
-  }
-
-  std::unique_ptr<TemporaryDir> temp_dir1;
-  std::unique_ptr<TemporaryDir> temp_dir2;
-};
 
 static bool bothWhiteSpace(char lhs, char rhs)
 {
@@ -190,6 +151,79 @@ static std::string expandVars(const std::string &str) {
   return replaceAll(str, "$NATIVE_TESTS", "/data/nativetest");
 #endif
 }
+
+class PerfProfdTest : public testing::Test {
+ protected:
+  virtual void SetUp() {
+    test_logger.Install();
+    create_dirs();
+  }
+
+  virtual void TearDown() {
+    android::base::SetLogger(android::base::StderrLogger);
+
+    // TODO: proper management of test files. For now, use old system() code.
+    for (const auto dir : { &dest_dir, &conf_dir }) {
+      std::string cmd("rm -rf ");
+      cmd += *dir;
+      int ret = system(cmd.c_str());
+      CHECK_EQ(0, ret);
+    }
+  }
+
+ protected:
+  //
+  // Check to see if the log messages emitted by the daemon
+  // match the expected result. By default we use a partial
+  // match, e.g. if we see the expected excerpt anywhere in the
+  // result, it's a match (for exact match, set exact to true)
+  //
+  void CompareLogMessages(const std::string& expected,
+                          const char* testpoint,
+                          bool exactMatch = false) {
+     std::string sqexp = squeezeWhite(expected, "expected");
+     std::string sqact = squeezeWhite(test_logger.JoinTestLog(" "), "actual");
+     if (exactMatch) {
+       EXPECT_STREQ(sqexp.c_str(), sqact.c_str());
+     } else {
+       std::size_t foundpos = sqact.find(sqexp);
+       bool wasFound = true;
+       if (foundpos == std::string::npos) {
+         std::cerr << testpoint << ": expected result not found\n";
+         std::cerr << " Actual: \"" << sqact << "\"\n";
+         std::cerr << " Expected: \"" << sqexp << "\"\n";
+         wasFound = false;
+       }
+       EXPECT_TRUE(wasFound);
+     }
+  }
+
+  // test_dir is the directory containing the test executable and
+  // any files associated with the test (will be created by the harness).
+  std::string test_dir;
+
+  // dest_dir is a temporary directory that we're using as the destination directory.
+  // It is backed by temp_dir1.
+  std::string dest_dir;
+
+  // conf_dir is a temporary directory that we're using as the configuration directory.
+  // It is backed by temp_dir2.
+  std::string conf_dir;
+
+  TestLogHelper test_logger;
+
+ private:
+  void create_dirs() {
+    temp_dir1.reset(new TemporaryDir());
+    temp_dir2.reset(new TemporaryDir());
+    dest_dir = temp_dir1->path;
+    conf_dir = temp_dir2->path;
+    test_dir = android::base::Dirname(gExecutableRealpath);
+  }
+
+  std::unique_ptr<TemporaryDir> temp_dir1;
+  std::unique_ptr<TemporaryDir> temp_dir2;
+};
 
 ///
 /// Helper class to kick off a run of the perfprofd daemon with a specific
@@ -360,34 +394,6 @@ static std::string encodedModuleSamplesToString(const wireless_android_play_play
 
 #define RAW_RESULT(x) #x
 
-//
-// Check to see if the log messages emitted by the daemon
-// match the expected result. By default we use a partial
-// match, e.g. if we see the expected excerpt anywhere in the
-// result, it's a match (for exact match, set exact to true)
-//
-static void compareLogMessages(const std::string &actual,
-                               const std::string &expected,
-                               const char *testpoint,
-                               bool exactMatch=false)
-{
-   std::string sqexp = squeezeWhite(expected, "expected");
-   std::string sqact = squeezeWhite(actual, "actual");
-   if (exactMatch) {
-     EXPECT_STREQ(sqexp.c_str(), sqact.c_str());
-   } else {
-     std::size_t foundpos = sqact.find(sqexp);
-     bool wasFound = true;
-     if (foundpos == std::string::npos) {
-       std::cerr << testpoint << ": expected result not found\n";
-       std::cerr << " Actual: \"" << sqact << "\"\n";
-       std::cerr << " Expected: \"" << sqexp << "\"\n";
-       wasFound = false;
-     }
-     EXPECT_TRUE(wasFound);
-   }
-}
-
 TEST_F(PerfProfdTest, TestUtil)
 {
   EXPECT_EQ("", replaceAll("", "", ""));
@@ -428,7 +434,7 @@ TEST_F(PerfProfdTest, MissingGMS)
                                           );
 
   // check to make sure entire log matches
-  compareLogMessages(JoinTestLog(" "), expected, "MissingGMS");
+  CompareLogMessages(expected, "MissingGMS");
 }
 
 
@@ -464,7 +470,7 @@ TEST_F(PerfProfdTest, MissingOptInSemaphoreFile)
       I: profile collection skipped (missing config directory)
                                           );
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expected, "MissingOptInSemaphoreFile");
+  CompareLogMessages(expected, "MissingOptInSemaphoreFile");
 }
 
 TEST_F(PerfProfdTest, MissingPerfExecutable)
@@ -501,7 +507,7 @@ TEST_F(PerfProfdTest, MissingPerfExecutable)
       I: profile collection skipped (missing 'perf' executable)
                                           );
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expected, "MissingPerfExecutable");
+  CompareLogMessages(expected, "MissingPerfExecutable");
 }
 
 TEST_F(PerfProfdTest, BadPerfRun)
@@ -539,7 +545,7 @@ TEST_F(PerfProfdTest, BadPerfRun)
                                           );
 
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expected, "BadPerfRun");
+  CompareLogMessages(expected, "BadPerfRun");
 }
 
 TEST_F(PerfProfdTest, ConfigFileParsing)
@@ -577,7 +583,7 @@ TEST_F(PerfProfdTest, ConfigFileParsing)
                                           );
 
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expected, "ConfigFileParsing");
+  CompareLogMessages(expected, "ConfigFileParsing");
 }
 
 TEST_F(PerfProfdTest, ProfileCollectionAnnotations)
@@ -616,7 +622,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerf)
   // Kick off encoder and check return code
   PROFILE_RESULT result =
       encode_to_proto(input_perf_data, encoded_file_path(dest_dir, 0).c_str(), config, 0, nullptr);
-  ASSERT_EQ(OK_PROFILE_COLLECTION, result) << JoinTestLog(" ");
+  ASSERT_EQ(OK_PROFILE_COLLECTION, result) << test_logger.JoinTestLog(" ");
 
   // Read and decode the resulting perf.data.encoded file
   wireless_android_play_playlog::AndroidPerfProfile encodedProfile;
@@ -624,8 +630,8 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerf)
                      "BasicRunWithCannedPerf",
                      encodedProfile);
 
-  // Expect 45 programs
-  EXPECT_EQ(45, encodedProfile.programs_size());
+  // Expect 48 programs
+  EXPECT_EQ(48, encodedProfile.programs_size());
 
   // Check a couple of load modules
   { const auto &lm0 = encodedProfile.load_modules(0);
@@ -648,7 +654,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerf)
   }
 
   // Examine some of the samples now
-  { const auto &p1 = encodedProfile.programs(0);
+  { const auto &p1 = encodedProfile.programs(9);
     const auto &lm1 = p1.modules(0);
     std::string act_lm1 = encodedModuleSamplesToString(lm1);
     std::string sqact1 = squeezeWhite(act_lm1, "actual for lm1");
@@ -658,7 +664,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerf)
     std::string sqexp1 = squeezeWhite(expected_lm1, "expected_lm1");
     EXPECT_STREQ(sqexp1.c_str(), sqact1.c_str());
   }
-  { const auto &p1 = encodedProfile.programs(2);
+  { const auto &p1 = encodedProfile.programs(11);
     const auto &lm2 = p1.modules(0);
     std::string act_lm2 = encodedModuleSamplesToString(lm2);
     std::string sqact2 = squeezeWhite(act_lm2, "actual for lm2");
@@ -713,7 +719,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerfWithSymbolizer)
                      encodedProfile);
 
   // Expect 45 programs
-  EXPECT_EQ(45, encodedProfile.programs_size());
+  EXPECT_EQ(48, encodedProfile.programs_size());
 
   // Check a couple of load modules
   { const auto &lm0 = encodedProfile.load_modules(0);
@@ -738,7 +744,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerfWithSymbolizer)
   }
 
   // Examine some of the samples now
-  { const auto &p1 = encodedProfile.programs(0);
+  { const auto &p1 = encodedProfile.programs(9);
     const auto &lm1 = p1.modules(0);
     std::string act_lm1 = encodedModuleSamplesToString(lm1);
     std::string sqact1 = squeezeWhite(act_lm1, "actual for lm1");
@@ -748,7 +754,7 @@ TEST_F(PerfProfdTest, BasicRunWithCannedPerfWithSymbolizer)
     std::string sqexp1 = squeezeWhite(expected_lm1, "expected_lm1");
     EXPECT_STREQ(sqexp1.c_str(), sqact1.c_str());
   }
-  { const auto &p1 = encodedProfile.programs(2);
+  { const auto &p1 = encodedProfile.programs(11);
     const auto &lm2 = p1.modules(0);
     std::string act_lm2 = encodedModuleSamplesToString(lm2);
     std::string sqact2 = squeezeWhite(act_lm2, "actual for lm2");
@@ -817,7 +823,7 @@ TEST_F(PerfProfdTest, CallchainRunWithCannedPerf)
   }
 
   // Examine some of the samples now
-  { const auto &p0 = encodedProfile.programs(0);
+  { const auto &p0 = encodedProfile.programs(1);
     const auto &lm1 = p0.modules(0);
     std::string act_lm1 = encodedModuleSamplesToString(lm1);
     std::string sqact1 = squeezeWhite(act_lm1, "actual for lm1");
@@ -857,6 +863,8 @@ TEST_F(PerfProfdTest, BasicRunWithLivePerf)
   runner.addToConfig("max_unprocessed_profiles=100");
   runner.addToConfig("collection_interval=9999");
   runner.addToConfig("sample_duration=2");
+  // Avoid the symbolizer for spurious messages.
+  runner.addToConfig("use_elf_symbolizer=0");
 
   // Create semaphore file
   runner.create_semaphore_file();
@@ -889,7 +897,7 @@ TEST_F(PerfProfdTest, BasicRunWithLivePerf)
       I: finishing Android Wide Profiling daemon
                                           );
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expandVars(expected), "BasicRunWithLivePerf", true);
+  CompareLogMessages(expandVars(expected), "BasicRunWithLivePerf", true);
 }
 
 TEST_F(PerfProfdTest, MultipleRunWithLivePerf)
@@ -908,6 +916,8 @@ TEST_F(PerfProfdTest, MultipleRunWithLivePerf)
   runner.addToConfig("use_fixed_seed=12345678");
   runner.addToConfig("collection_interval=9999");
   runner.addToConfig("sample_duration=2");
+  // Avoid the symbolizer for spurious messages.
+  runner.addToConfig("use_elf_symbolizer=0");
   runner.write_processed_file(1, 2);
 
   // Create semaphore file
@@ -956,7 +966,7 @@ TEST_F(PerfProfdTest, MultipleRunWithLivePerf)
       I: finishing Android Wide Profiling daemon
                                           );
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expandVars(expected), "BasicRunWithLivePerf", true);
+  CompareLogMessages(expandVars(expected), "BasicRunWithLivePerf", true);
 }
 
 TEST_F(PerfProfdTest, CallChainRunWithLivePerf)
@@ -976,6 +986,8 @@ TEST_F(PerfProfdTest, CallChainRunWithLivePerf)
   runner.addToConfig("collection_interval=9999");
   runner.addToConfig("stack_profile=1");
   runner.addToConfig("sample_duration=2");
+  // Avoid the symbolizer for spurious messages.
+  runner.addToConfig("use_elf_symbolizer=0");
 
   // Create semaphore file
   runner.create_semaphore_file();
@@ -1008,7 +1020,7 @@ TEST_F(PerfProfdTest, CallChainRunWithLivePerf)
       I: finishing Android Wide Profiling daemon
                                           );
   // check to make sure log excerpt matches
-  compareLogMessages(JoinTestLog(" "), expandVars(expected), "CallChainRunWithLivePerf", true);
+  CompareLogMessages(expandVars(expected), "CallChainRunWithLivePerf", true);
 }
 
 int main(int argc, char **argv) {
