@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <android-base/logging.h>
+#include <android-base/quick_exit.h>
 
 #include "utils.h"
 
@@ -150,5 +151,9 @@ bool RunSimpleperfCmd(int argc, char** argv) {
   bool result = command->Run(args);
   LOG(DEBUG) << "command '" << command_name << "' "
              << (result ? "finished successfully" : "failed");
+  // Quick exit to avoid cost freeing memory and closing files.
+  fflush(stdout);
+  fflush(stderr);
+  android::base::quick_exit(result ? 0 : 1);
   return result;
 }
