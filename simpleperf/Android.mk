@@ -34,10 +34,9 @@ LLVM_ROOT_PATH := external/llvm
 include $(LLVM_ROOT_PATH)/llvm.mk
 
 simpleperf_static_libraries_target := \
-  libbacktrace_offline \
   libbacktrace \
-  libunwind \
   libunwindstack \
+  libdexfile \
   libziparchive \
   libz \
   libbase \
@@ -76,9 +75,7 @@ simpleperf_static_libraries_host := \
 
 simpleperf_static_libraries_host_linux := \
   libprocinfo \
-  libbacktrace_offline \
   libbacktrace \
-  libunwind \
   libunwindstack \
   libdexfile \
   libcutils \
@@ -110,6 +107,7 @@ libsimpleperf_src_files := \
 
 libsimpleperf_src_files_linux := \
   CallChainJoiner.cpp \
+  cmd_debug_unwind.cpp \
   cmd_list.cpp \
   cmd_record.cpp \
   cmd_stat.cpp \
@@ -364,6 +362,7 @@ simpleperf_unit_test_src_files := \
 
 simpleperf_unit_test_src_files_linux := \
   CallChainJoiner_test.cpp \
+  cmd_debug_unwind_test.cpp \
   cmd_dumprecord_test.cpp \
   cmd_list_test.cpp \
   cmd_record_test.cpp \
