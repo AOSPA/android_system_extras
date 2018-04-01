@@ -15,21 +15,13 @@
  * limitations under the License.
  */
 
-#ifndef SYSTEM_EXTRAS_PERFPROFD_SYMBOLIZER_H_
-#define SYSTEM_EXTRAS_PERFPROFD_SYMBOLIZER_H_
+#ifndef SYSTEM_EXTRAS_PERFPROFD_PERFPROFD_RECORD_FWD_H_
+#define SYSTEM_EXTRAS_PERFPROFD_PERFPROFD_RECORD_FWD_H_
 
-#include <memory>
-
+namespace android {
 namespace perfprofd {
-
-struct Symbolizer {
-  virtual ~Symbolizer() {}
-  virtual std::string Decode(const std::string& dso, uint64_t address) = 0;
-  virtual bool GetMinExecutableVAddr(const std::string& dso, uint64_t* addr) = 0;
-};
-
-std::unique_ptr<Symbolizer> CreateELFSymbolizer();
-
+class PerfprofdRecord;
 }  // namespace perfprofd
+}  // namespace android
 
-#endif  // SYSTEM_EXTRAS_PERFPROFD_SYMBOLIZER_H_
+#endif  // SYSTEM_EXTRAS_PERFPROFD_PERFPROFD_RECORD_FWD_H_
