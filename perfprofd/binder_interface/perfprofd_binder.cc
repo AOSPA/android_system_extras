@@ -17,8 +17,6 @@
 
 #include "perfprofd_binder.h"
 
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -26,16 +24,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <functional>
 
 #include <inttypes.h>
 #include <unistd.h>
 
-#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
-#include <android-base/unique_fd.h>
-#include <android/os/DropBoxManager.h>
 #include <binder/BinderService.h>
 #include <binder/IResultReceiver.h>
 #include <binder/Status.h>
@@ -49,67 +43,21 @@
 #include "perfprofd_record.pb.h"
 
 #include "config.h"
+#include "configreader.h"
 #include "perfprofdcore.h"
-#include "perfprofd_io.h"
+#include "perfprofd_threaded_handler.h"
 
 namespace android {
 namespace perfprofd {
 namespace binder {
 
+namespace {
+
 using Status = ::android::binder::Status;
 
-class BinderConfig : public Config {
- public:
-  bool send_to_dropbox = false;
-
-  bool is_profiling = false;
-
-  void Sleep(size_t seconds) override {
-    if (seconds == 0) {
-      return;
-    }
-    std::unique_lock<std::mutex> guard(mutex_);
-    using namespace std::chrono_literals;
-    cv_.wait_for(guard, seconds * 1s, [&]() { return interrupted_; });
-  }
-  bool ShouldStopProfiling() override {
-    std::unique_lock<std::mutex> guard(mutex_);
-    return interrupted_;
-  }
-
-  void ResetStopProfiling() {
-    std::unique_lock<std::mutex> guard(mutex_);
-    interrupted_ = false;
-  }
-  void StopProfiling() {
-    std::unique_lock<std::mutex> guard(mutex_);
-    interrupted_ = true;
-    cv_.notify_all();
-  }
-
-  bool IsProfilingEnabled() const override {
-    return true;
-  }
-
-  // Operator= to simplify setting the config values. This will retain the
-  // original mutex, condition-variable etc.
-  BinderConfig& operator=(const BinderConfig& rhs) {
-    // Copy base fields.
-    *static_cast<Config*>(this) = static_cast<const Config&>(rhs);
-
-    send_to_dropbox = rhs.send_to_dropbox;
-
-    return *this;
-  }
-
- private:
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  bool interrupted_ = false;
-};
-
 class PerfProfdNativeService : public BinderService<PerfProfdNativeService>,
-                               public ::android::os::BnPerfProfd {
+                               public ::android::os::BnPerfProfd,
+                               public ThreadedHandler {
  public:
   static status_t start();
   static int Main();
@@ -119,8 +67,8 @@ class PerfProfdNativeService : public BinderService<PerfProfdNativeService>,
   status_t dump(int fd, const Vector<String16> &args) override;
 
   Status startProfiling(int32_t profilingDuration,
-                                int32_t profilingInterval,
-                                int32_t iterations) override;
+                        int32_t profilingInterval,
+                        int32_t iterations) override;
   Status startProfilingProtobuf(const std::vector<uint8_t>& config_proto) override;
 
   Status stopProfiling() override;
@@ -132,120 +80,11 @@ class PerfProfdNativeService : public BinderService<PerfProfdNativeService>,
                       uint32_t _aidl_flags = 0) override;
 
  private:
-  // Handler for ProfilingLoop.
-  bool BinderHandler(android::perfprofd::PerfprofdRecord* encodedProfile,
-                     Config* config);
-  // Helper for the handler.
-  HandlerFn GetBinderHandler();
-
   status_t shellCommand(int /*in*/, int out, int err, Vector<String16>& args);
 
-  template <typename ConfigFn> Status StartProfiling(ConfigFn fn);
   template <typename ProtoLoaderFn> Status StartProfilingProtobuf(ProtoLoaderFn fn);
   Status StartProfilingProtobufFd(int fd);
-
-  std::mutex lock_;
-
-  BinderConfig cur_config_;
-
-  int seq_ = 0;
 };
-
-static Status WriteDropboxFile(android::perfprofd::PerfprofdRecord* encodedProfile,
-                               Config* config) {
-  android::base::unique_fd tmp_fd;
-  {
-    char path[PATH_MAX];
-    snprintf(path,
-             sizeof(path),
-             "%s%cdropboxtmp-XXXXXX",
-             config->destination_directory.c_str(),
-             OS_PATH_SEPARATOR);
-    tmp_fd.reset(mkstemp(path));
-    if (tmp_fd.get() == -1) {
-      PLOG(ERROR) << "Could not create temp file " << path;
-      return Status::fromExceptionCode(1, "Could not create temp file");
-    }
-    if (unlink(path) != 0) {
-      PLOG(WARNING) << "Could not unlink binder temp file";
-    }
-  }
-
-  // Dropbox takes ownership of the fd, and if it is not readonly,
-  // a selinux violation will occur. Get a read-only version.
-  android::base::unique_fd read_only;
-  {
-    char fdpath[64];
-    snprintf(fdpath, arraysize(fdpath), "/proc/self/fd/%d", tmp_fd.get());
-    read_only.reset(open(fdpath, O_RDONLY | O_CLOEXEC));
-    if (read_only.get() < 0) {
-      PLOG(ERROR) << "Could not create read-only fd";
-      return Status::fromExceptionCode(1, "Could not create read-only fd");
-    }
-  }
-
-  constexpr bool kCompress = true;  // Ignore the config here. Dropbox will always end up
-                                    // compressing the data, might as well make the temp
-                                    // file smaller and help it out.
-  using DropBoxManager = android::os::DropBoxManager;
-  constexpr int kDropboxFlags = DropBoxManager::IS_GZIPPED;
-
-  if (!SerializeProtobuf(encodedProfile, std::move(tmp_fd), kCompress)) {
-    return Status::fromExceptionCode(1, "Could not serialize to temp file");
-  }
-
-  sp<DropBoxManager> dropbox(new DropBoxManager());
-  return dropbox->addFile(String16("perfprofd"), read_only.release(), kDropboxFlags);
-}
-
-bool PerfProfdNativeService::BinderHandler(
-    android::perfprofd::PerfprofdRecord* encodedProfile,
-    Config* config) {
-  CHECK(config != nullptr);
-  if (static_cast<BinderConfig*>(config)->send_to_dropbox) {
-    size_t size = encodedProfile->ByteSize();
-    Status status;
-    if (size < 1024 * 1024) {
-      // For a small size, send as a byte buffer directly.
-      std::unique_ptr<uint8_t[]> data(new uint8_t[size]);
-      encodedProfile->SerializeWithCachedSizesToArray(data.get());
-
-      using DropBoxManager = android::os::DropBoxManager;
-      sp<DropBoxManager> dropbox(new DropBoxManager());
-      status = dropbox->addData(String16("perfprofd"),
-                                data.get(),
-                                size,
-                                0);
-    } else {
-      // For larger buffers, we need to go through the filesystem.
-      status = WriteDropboxFile(encodedProfile, config);
-    }
-    if (!status.isOk()) {
-      LOG(WARNING) << "Failed dropbox submission: " << status.toString8();
-    }
-    return status.isOk();
-  }
-
-  if (encodedProfile == nullptr) {
-    return false;
-  }
-  std::string data_file_path(config->destination_directory);
-  data_file_path += "/perf.data";
-  std::string path = android::base::StringPrintf("%s.encoded.%d", data_file_path.c_str(), seq_);
-  if (!SerializeProtobuf(encodedProfile, path.c_str(), config->compress)) {
-    return false;
-  }
-
-  seq_++;
-  return true;
-}
-
-HandlerFn PerfProfdNativeService::GetBinderHandler() {
-  return HandlerFn(std::bind(&PerfProfdNativeService::BinderHandler,
-                             this,
-                             std::placeholders::_1,
-                             std::placeholders::_2));
-}
 
 status_t PerfProfdNativeService::start() {
   IPCThreadState::self()->disableBackgroundScheduling(true);
@@ -269,14 +108,18 @@ status_t PerfProfdNativeService::dump(int fd, const Vector<String16> &args) {
 Status PerfProfdNativeService::startProfiling(int32_t profilingDuration,
                                               int32_t profilingInterval,
                                               int32_t iterations) {
-  auto config_fn = [&](BinderConfig& config) {
-    config = BinderConfig();  // Reset to a default config.
+  auto config_fn = [&](ThreadedConfig& config) {
+    config = ThreadedConfig();  // Reset to a default config.
 
     config.sample_duration_in_s = static_cast<uint32_t>(profilingDuration);
     config.collection_interval_in_s = static_cast<uint32_t>(profilingInterval);
     config.main_loop_iterations = static_cast<uint32_t>(iterations);
   };
-  return StartProfiling(config_fn);
+  std::string error_msg;
+  if (!StartProfiling(config_fn, &error_msg)) {
+    return Status::fromExceptionCode(1, error_msg.c_str());
+  }
+  return Status::ok();
 }
 Status PerfProfdNativeService::startProfilingProtobuf(const std::vector<uint8_t>& config_proto) {
   auto proto_loader_fn = [&config_proto](ProfilingConfig& proto_config) {
@@ -285,41 +128,14 @@ Status PerfProfdNativeService::startProfilingProtobuf(const std::vector<uint8_t>
   return StartProfilingProtobuf(proto_loader_fn);
 }
 
-template <typename ConfigFn>
-Status PerfProfdNativeService::StartProfiling(ConfigFn fn) {
-  std::lock_guard<std::mutex> guard(lock_);
-
-  if (cur_config_.is_profiling) {
-    // TODO: Define error code?
-    return binder::Status::fromServiceSpecificError(1);
-  }
-  cur_config_.is_profiling = true;
-  cur_config_.ResetStopProfiling();
-
-  fn(cur_config_);
-
-  HandlerFn handler = GetBinderHandler();
-  auto profile_runner = [handler](PerfProfdNativeService* service) {
-    ProfilingLoop(service->cur_config_, handler);
-
-    // This thread is done.
-    std::lock_guard<std::mutex> unset_guard(service->lock_);
-    service->cur_config_.is_profiling = false;
-  };
-  std::thread profiling_thread(profile_runner, this);
-  profiling_thread.detach();  // Let it go.
-
-  return binder::Status::ok();
-}
-
 template <typename ProtoLoaderFn>
 Status PerfProfdNativeService::StartProfilingProtobuf(ProtoLoaderFn fn) {
   ProfilingConfig proto_config;
   if (!fn(proto_config)) {
     return binder::Status::fromExceptionCode(2);
   }
-  auto config_fn = [&proto_config](BinderConfig& config) {
-    config = BinderConfig();  // Reset to a default config.
+  auto config_fn = [&proto_config](ThreadedConfig& config) {
+    config = ThreadedConfig();  // Reset to a default config.
 
     // Copy proto values.
 #define CHECK_AND_COPY_FROM_PROTO(name)      \
@@ -346,9 +162,14 @@ Status PerfProfdNativeService::StartProfilingProtobuf(ProtoLoaderFn fn) {
     CHECK_AND_COPY_FROM_PROTO(process)
     CHECK_AND_COPY_FROM_PROTO(use_elf_symbolizer)
     CHECK_AND_COPY_FROM_PROTO(send_to_dropbox)
+    CHECK_AND_COPY_FROM_PROTO(compress)
 #undef CHECK_AND_COPY_FROM_PROTO
   };
-  return StartProfiling(config_fn);
+  std::string error_msg;
+  if (!StartProfiling(config_fn, &error_msg)) {
+    return Status::fromExceptionCode(1, error_msg.c_str());
+  }
+  return Status::ok();
 }
 
 Status PerfProfdNativeService::StartProfilingProtobufFd(int fd) {
@@ -379,20 +200,16 @@ Status PerfProfdNativeService::StartProfilingProtobufFd(int fd) {
 }
 
 Status PerfProfdNativeService::stopProfiling() {
-  std::lock_guard<std::mutex> guard(lock_);
-  if (!cur_config_.is_profiling) {
-    // TODO: Define error code?
-    return Status::fromServiceSpecificError(1);
+  std::string error_msg;
+  if (!StopProfiling(&error_msg)) {
+    Status::fromExceptionCode(1, error_msg.c_str());
   }
-
-  cur_config_.StopProfiling();
-
   return Status::ok();
 }
 
 status_t PerfProfdNativeService::shellCommand(int in,
                                               int out,
-                                              int err,
+                                              int err_fd,
                                               Vector<String16>& args) {
   if (android::base::kEnableDChecks) {
     LOG(VERBOSE) << "Perfprofd::shellCommand";
@@ -402,24 +219,31 @@ status_t PerfProfdNativeService::shellCommand(int in,
     }
   }
 
+  auto err_str = std::fstream(base::StringPrintf("/proc/self/fd/%d", err_fd));
+
   if (args.size() >= 1) {
     if (args[0] == String16("dump")) {
       dump(out, args);
       return OK;
     } else if (args[0] == String16("startProfiling")) {
-      if (args.size() < 4) {
-        return BAD_VALUE;
+      ConfigReader reader;
+      for (size_t i = 1; i < args.size(); ++i) {
+        if (!reader.Read(String8(args[i]).string(), /* fail_on_error */ true)) {
+          err_str << base::StringPrintf("Could not parse %s", String8(args[i]).string())
+                  << std::endl;
+          return BAD_VALUE;
+        }
       }
-      // TODO: handle invalid strings.
-      int32_t duration = strtol(String8(args[1]).string(), nullptr, 0);
-      int32_t interval = strtol(String8(args[2]).string(), nullptr, 0);
-      int32_t iterations = strtol(String8(args[3]).string(), nullptr, 0);
-      Status status = startProfiling(duration, interval, iterations);
-      if (status.isOk()) {
-        return OK;
-      } else {
-        return status.serviceSpecificErrorCode();
+      auto config_fn = [&](ThreadedConfig& config) {
+        config = ThreadedConfig();  // Reset to a default config.
+        reader.FillConfig(&config);
+      };
+      std::string error_msg;
+      if (!StartProfiling(config_fn, &error_msg)) {
+        err_str << error_msg << std::endl;
+        return UNKNOWN_ERROR;
       }
+      return OK;
     } else if (args[0] == String16("startProfilingProto")) {
       if (args.size() < 2) {
         return BAD_VALUE;
@@ -431,20 +255,23 @@ status_t PerfProfdNativeService::shellCommand(int in,
         // TODO: Implement reading from disk?
       }
       if (fd < 0) {
+        err_str << "Bad file descriptor " << args[1] << std::endl;
         return BAD_VALUE;
       }
       binder::Status status = StartProfilingProtobufFd(fd);
       if (status.isOk()) {
         return OK;
       } else {
-        return status.serviceSpecificErrorCode();
+        err_str << status.toString8() << std::endl;
+        return UNKNOWN_ERROR;
       }
     } else if (args[0] == String16("stopProfiling")) {
       Status status = stopProfiling();
       if (status.isOk()) {
         return OK;
       } else {
-        return status.serviceSpecificErrorCode();
+        err_str << status.toString8() << std::endl;
+        return UNKNOWN_ERROR;
       }
     }
   }
@@ -483,6 +310,8 @@ status_t PerfProfdNativeService::onTransact(uint32_t _aidl_code,
       return BBinder::onTransact(_aidl_code, _aidl_data, _aidl_reply, _aidl_flags);
   }
 }
+
+}  // namespace
 
 int Main() {
   android::status_t ret;

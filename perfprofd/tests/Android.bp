@@ -36,9 +36,6 @@ cc_test {
         "liblog",
     ],
     target: {
-        darwin: {
-            enabled: false,
-        },
         host: {
             host_ldlibs: [
                 "-lncurses",
@@ -49,6 +46,11 @@ cc_test {
         android: {
             required: [
                 "simpleperf",
+            ],
+            shared_libs: [
+                "libbinder",
+                "libservices",
+                "libutils",
             ],
         },
 
