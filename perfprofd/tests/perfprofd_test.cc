@@ -43,6 +43,8 @@
 #include "configreader.h"
 #include "map_utils.h"
 #include "perfprofdcore.h"
+#include "perfprofd_cmdline.h"
+#include "perfprofd_threaded_handler.h"
 #include "quipper_helper.h"
 #include "symbolizer.h"
 
@@ -613,7 +615,6 @@ TEST_F(PerfProfdTest, ConfigFileParsing)
   // assorted bad syntax
   runner.addToConfig("collection_interval=0");
   runner.addToConfig("collection_interval=-1");
-  runner.addToConfig("collection_interval=2");
   runner.addToConfig("nonexistent_key=something");
   runner.addToConfig("no_equals_stmt");
 
@@ -625,11 +626,10 @@ TEST_F(PerfProfdTest, ConfigFileParsing)
 
   // Verify log contents
   const std::string expected = RAW_RESULT(
-      W: line 6: specified value 0 for 'collection_interval' outside permitted range [100 4294967295] (ignored)
+      W: line 6: specified value 0 for 'collection_interval' outside permitted range [1 4294967295] (ignored)
       W: line 7: malformed unsigned value (ignored)
-      W: line 8: specified value 2 for 'collection_interval' outside permitted range [100 4294967295] (ignored)
-      W: line 9: unknown option 'nonexistent_key' ignored
-      W: line 10: line malformed (no '=' found)
+      W: line 8: unknown option 'nonexistent_key' ignored
+      W: line 9: line malformed (no '=' found)
                                           );
 
   // check to make sure log excerpt matches
@@ -1295,6 +1295,44 @@ TEST_F(RangeMapTest, TestRangeMap) {
 
   map.Insert("c", 50);
   EXPECT_STREQ("1#a[1,2,10,]50#c[50,]100#a[100,]199#b[199,200,]", print().c_str());
+}
+
+class ThreadedHandlerTest : public PerfProfdTest {
+ public:
+  void SetUp() override {
+    PerfProfdTest::SetUp();
+    threaded_handler_.reset(new android::perfprofd::ThreadedHandler());
+  }
+
+  void TearDown() override {
+    threaded_handler_.reset();
+    PerfProfdTest::TearDown();
+  }
+
+ protected:
+  std::unique_ptr<android::perfprofd::ThreadedHandler> threaded_handler_;
+};
+
+TEST_F(ThreadedHandlerTest, Basic) {
+  std::string error_msg;
+  EXPECT_FALSE(threaded_handler_->StopProfiling(&error_msg));
+}
+
+#ifdef __ANDROID__
+#define ThreadedHandlerTestName(x) x
+#else
+#define ThreadedHandlerTestName(x) DISABLED_ ## x
+#endif
+
+TEST_F(ThreadedHandlerTest, ThreadedHandlerTestName(Live)) {
+  auto config_fn = [](android::perfprofd::ThreadedConfig& config) {
+    // Use some values that make it likely that things don't fail quickly.
+    config.main_loop_iterations = 0;
+    config.collection_interval_in_s = 1000000;
+  };
+  std::string error_msg;
+  ASSERT_TRUE(threaded_handler_->StartProfiling(config_fn, &error_msg)) << error_msg;
+  EXPECT_TRUE(threaded_handler_->StopProfiling(&error_msg)) << error_msg;
 }
 
 int main(int argc, char **argv) {
