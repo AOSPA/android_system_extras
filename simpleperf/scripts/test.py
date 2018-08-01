@@ -34,41 +34,41 @@ Tested python scripts include:
 Test using both `adb root` and `adb unroot`.
 
 """
-
+from __future__ import print_function
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
-import tempfile
 import time
+import types
 import unittest
 
+from app_profiler import NativeLibDownloader
 from simpleperf_report_lib import ReportLib
-from utils import *
+from utils import log_info, log_fatal
+from utils import AdbHelper, Addr2Nearestline, get_script_dir, is_windows, Objdump, ReadElf, remove
 
-has_google_protobuf = True
 try:
+    # pylint: disable=unused-import
     import google.protobuf
-except:
-    has_google_protobuf = False
+    HAS_GOOGLE_PROTOBUF = True
+except ImportError:
+    HAS_GOOGLE_PROTOBUF = False
 
-inferno_script = os.path.join(get_script_dir(), "inferno.bat" if is_windows() else "./inferno.sh")
+INFERNO_SCRIPT = os.path.join(get_script_dir(), "inferno.bat" if is_windows() else "./inferno.sh")
 
-support_trace_offcpu = None
+def get_device_features():
+    adb = AdbHelper()
+    adb.check_run_and_return_output(['push',
+                                     'bin/android/%s/simpleperf' % adb.get_device_arch(),
+                                     '/data/local/tmp'])
+    adb.check_run_and_return_output(['shell', 'chmod', 'a+x', '/data/local/tmp/simpleperf'])
+    return adb.check_run_and_return_output(['shell', '/data/local/tmp/simpleperf', 'list',
+                                            '--show-features'])
 
-def is_trace_offcpu_supported():
-    global support_trace_offcpu
-    if support_trace_offcpu is None:
-        adb = AdbHelper()
-        adb.check_run_and_return_output(['push',
-                                         'bin/android/%s/simpleperf' % adb.get_device_arch(),
-                                         "/data/local/tmp"])
-        adb.check_run_and_return_output(['shell', 'chmod', 'a+x', '/data/local/tmp/simpleperf'])
-        output = adb.check_run_and_return_output(['shell', '/data/local/tmp/simpleperf', 'list',
-                                                  '--show-features'])
-        support_trace_offcpu = 'trace-offcpu' in output
-    return support_trace_offcpu
+SUPPORT_TRACE_OFFCPU = 'trace-offcpu' in get_device_features()
 
 def build_testdata():
     """ Collect testdata from ../testdata and ../demo. """
@@ -76,10 +76,10 @@ def build_testdata():
     from_demo_path = os.path.join('..', 'demo')
     from_script_testdata_path = 'script_testdata'
     if (not os.path.isdir(from_testdata_path) or not os.path.isdir(from_demo_path) or
-        not from_script_testdata_path):
+            not from_script_testdata_path):
         return
     copy_testdata_list = ['perf_with_symbols.data', 'perf_with_trace_offcpu.data',
-                          'perf_with_tracepoint_event.data']
+                          'perf_with_tracepoint_event.data', 'perf_with_interpreter_frames.data']
     copy_demo_list = ['SimpleperfExamplePureJava', 'SimpleperfExampleWithNative',
                       'SimpleperfExampleOfKotlin']
 
@@ -105,11 +105,12 @@ class TestBase(unittest.TestCase):
                 subproc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=use_shell)
                 (output_data, _) = subproc.communicate()
                 returncode = subproc.returncode
-        except:
+        except OSError:
             returncode = None
         self.assertEqual(returncode, 0, msg="failed to run cmd: %s" % args)
         if return_output:
             return output_data
+        return ''
 
 
 class TestExampleBase(TestBase):
@@ -137,10 +138,26 @@ class TestExampleBase(TestBase):
         cls.adb.check_run(args)
         cls.adb_root = adb_root
         cls.compiled = False
+        cls.has_perf_data_for_report = False
+        android_version = cls.adb.get_android_version()
+        # On Android >= P (version 9), we can profile JITed and interpreted Java code.
+        # So only compile Java code on Android <= O (version 8).
+        cls.use_compiled_java_code = android_version <= 8
 
     def setUp(self):
-        if self.id().find('TraceOffCpu') != -1 and not is_trace_offcpu_supported():
+        if self.id().find('TraceOffCpu') != -1 and not SUPPORT_TRACE_OFFCPU:
             self.skipTest('trace-offcpu is not supported on device')
+        cls = self.__class__
+        if not cls.has_perf_data_for_report:
+            cls.has_perf_data_for_report = True
+            self.run_app_profiler()
+            shutil.copy('perf.data', 'perf.data_for_report')
+            remove('binary_cache_for_report')
+            shutil.copytree('binary_cache', 'binary_cache_for_report')
+        else:
+            shutil.copy('perf.data_for_report', 'perf.data')
+            remove('binary_cache')
+            shutil.copytree('binary_cache_for_report', 'binary_cache')
 
     @classmethod
     def tearDownClass(cls):
@@ -153,55 +170,51 @@ class TestExampleBase(TestBase):
         remove("perf.data")
         remove("report.txt")
         remove("pprof.profile")
+        if cls.has_perf_data_for_report:
+            cls.has_perf_data_for_report = False
+            remove('perf.data_for_report')
+            remove('binary_cache_for_report')
 
     def run(self, result=None):
         self.__class__.test_result = result
-        super(TestBase, self).run(result)
+        super(TestExampleBase, self).run(result)
 
-    def run_app_profiler(self, record_arg = "-g -f 1000 --duration 3 -e cpu-cycles:u",
-                         build_binary_cache=True, skip_compile=False, start_activity=True,
-                         native_lib_dir=None, profile_from_launch=False, add_arch=False):
-        args = ["app_profiler.py", "--app", self.package_name, "--apk", self.apk_path,
-                "-r", record_arg, "-o", "perf.data"]
+    def run_app_profiler(self, record_arg="-g --duration 10", build_binary_cache=True,
+                         start_activity=True):
+        args = ['app_profiler.py', '--app', self.package_name, '-r', record_arg, '-o', 'perf.data']
         if not build_binary_cache:
             args.append("-nb")
-        if skip_compile or self.__class__.compiled:
-            args.append("-nc")
+        if self.use_compiled_java_code and not self.__class__.compiled:
+            args.append('--compile_java_code')
+            self.__class__.compiled = True
         if start_activity:
             args += ["-a", self.activity_name]
-        if native_lib_dir:
-            args += ["-lib", native_lib_dir]
-        if profile_from_launch:
-            args.append("--profile_from_launch")
-        if add_arch:
-            args += ["--arch", self.abi]
+        args += ["-lib", self.example_path]
         if not self.adb_root:
             args.append("--disable_adb_root")
         self.run_cmd(args)
-        self.check_exist(file="perf.data")
+        self.check_exist(filename="perf.data")
         if build_binary_cache:
-            self.check_exist(dir="binary_cache")
-        if not skip_compile:
-            self.__class__.compiled = True
+            self.check_exist(dirname="binary_cache")
 
-    def check_exist(self, file=None, dir=None):
-        if file:
-            self.assertTrue(os.path.isfile(file), file)
-        if dir:
-            self.assertTrue(os.path.isdir(dir), dir)
+    def check_exist(self, filename=None, dirname=None):
+        if filename:
+            self.assertTrue(os.path.isfile(filename), filename)
+        if dirname:
+            self.assertTrue(os.path.isdir(dirname), dirname)
 
-    def check_file_under_dir(self, dir, file):
-        self.check_exist(dir=dir)
-        for _, _, files in os.walk(dir):
+    def check_file_under_dir(self, dirname, filename):
+        self.check_exist(dirname=dirname)
+        for _, _, files in os.walk(dirname):
             for f in files:
-                if f == file:
+                if f == filename:
                     return
-        self.fail("Failed to call check_file_under_dir(dir=%s, file=%s)" % (dir, file))
+        self.fail("Failed to call check_file_under_dir(dir=%s, file=%s)" % (dirname, filename))
 
 
-    def check_strings_in_file(self, file, strings):
-        self.check_exist(file=file)
-        with open(file, 'r') as fh:
+    def check_strings_in_file(self, filename, strings):
+        self.check_exist(filename=filename)
+        with open(filename, 'r') as fh:
             self.check_strings_in_content(fh.read(), strings)
 
     def check_strings_in_content(self, content, strings):
@@ -213,17 +226,15 @@ class TestExampleBase(TestBase):
             This function checks for each entry, if the line containing [name]
             has at least required accumulated_period and period.
         """
-        self.check_exist(file=summary_file)
+        self.check_exist(filename=summary_file)
         with open(summary_file, 'r') as fh:
             summary = fh.read()
         fulfilled = [False for x in check_entries]
-        if not hasattr(self, "summary_check_re"):
-            self.summary_check_re = re.compile(r'accumulated_period:\s*([\d.]+)%.*period:\s*([\d.]+)%')
+        summary_check_re = re.compile(r'accumulated_period:\s*([\d.]+)%.*period:\s*([\d.]+)%')
         for line in summary.split('\n'):
-            for i in range(len(check_entries)):
-                (name, need_acc_period, need_period) = check_entries[i]
+            for i, (name, need_acc_period, need_period) in enumerate(check_entries):
                 if not fulfilled[i] and name in line:
-                    m = self.summary_check_re.search(line)
+                    m = summary_check_re.search(line)
                     if m:
                         acc_period = float(m.group(1))
                         period = float(m.group(2))
@@ -231,9 +242,9 @@ class TestExampleBase(TestBase):
                             fulfilled[i] = True
         self.assertEqual(len(fulfilled), sum([int(x) for x in fulfilled]), fulfilled)
 
-    def check_inferno_report_html(self, check_entries, file="report.html"):
-        self.check_exist(file=file)
-        with open(file, 'r') as fh:
+    def check_inferno_report_html(self, check_entries, filename="report.html"):
+        self.check_exist(filename=filename)
+        with open(filename, 'r') as fh:
             data = fh.read()
         fulfilled = [False for _ in check_entries]
         for line in data.split('\n'):
@@ -245,7 +256,7 @@ class TestExampleBase(TestBase):
                 if m and float(m.group(1)) >= entry[1]:
                     fulfilled[i] = True
                     break
-        self.assertEqual(fulfilled, [True for x in check_entries])
+        self.assertEqual(fulfilled, [True for _ in check_entries])
 
     def common_test_app_profiler(self):
         self.run_cmd(["app_profiler.py", "-h"])
@@ -256,82 +267,72 @@ class TestExampleBase(TestBase):
         if not self.adb_root:
             args.append("--disable_adb_root")
         self.run_cmd(args)
-        self.check_exist(dir="binary_cache")
+        self.check_exist(dirname="binary_cache")
         remove("binary_cache")
         self.run_app_profiler(build_binary_cache=True)
-        self.run_app_profiler(skip_compile=True)
+        self.run_app_profiler()
         self.run_app_profiler(start_activity=False)
 
     def common_test_report(self):
         self.run_cmd(["report.py", "-h"])
-        self.run_app_profiler(build_binary_cache=False)
         self.run_cmd(["report.py"])
         self.run_cmd(["report.py", "-i", "perf.data"])
         self.run_cmd(["report.py", "-g"])
-        self.run_cmd(["report.py", "--self-kill-for-testing",  "-g", "--gui"])
+        self.run_cmd(["report.py", "--self-kill-for-testing", "-g", "--gui"])
 
     def common_test_annotate(self):
         self.run_cmd(["annotate.py", "-h"])
-        self.run_app_profiler()
         remove("annotated_files")
         self.run_cmd(["annotate.py", "-s", self.example_path])
-        self.check_exist(dir="annotated_files")
+        self.check_exist(dirname="annotated_files")
 
     def common_test_report_sample(self, check_strings):
         self.run_cmd(["report_sample.py", "-h"])
-        remove("binary_cache")
-        self.run_app_profiler(build_binary_cache=False)
         self.run_cmd(["report_sample.py"])
         output = self.run_cmd(["report_sample.py", "perf.data"], return_output=True)
-        self.check_strings_in_content(output, check_strings)
-        self.run_app_profiler(record_arg="-g -f 1000 --duration 3 -e cpu-cycles:u --no-dump-symbols")
-        output = self.run_cmd(["report_sample.py", "--symfs", "binary_cache"], return_output=True)
         self.check_strings_in_content(output, check_strings)
 
     def common_test_pprof_proto_generator(self, check_strings_with_lines,
                                           check_strings_without_lines):
-        if not has_google_protobuf:
+        if not HAS_GOOGLE_PROTOBUF:
             log_info('Skip test for pprof_proto_generator because google.protobuf is missing')
             return
         self.run_cmd(["pprof_proto_generator.py", "-h"])
-        self.run_app_profiler()
         self.run_cmd(["pprof_proto_generator.py"])
         remove("pprof.profile")
         self.run_cmd(["pprof_proto_generator.py", "-i", "perf.data", "-o", "pprof.profile"])
-        self.check_exist(file="pprof.profile")
+        self.check_exist(filename="pprof.profile")
         self.run_cmd(["pprof_proto_generator.py", "--show"])
         output = self.run_cmd(["pprof_proto_generator.py", "--show", "pprof.profile"],
                               return_output=True)
-        self.check_strings_in_content(output, check_strings_with_lines +
-                                              ["has_line_numbers: True"])
+        self.check_strings_in_content(output, check_strings_with_lines + ["has_line_numbers: True"])
         remove("binary_cache")
         self.run_cmd(["pprof_proto_generator.py"])
         output = self.run_cmd(["pprof_proto_generator.py", "--show", "pprof.profile"],
                               return_output=True)
         self.check_strings_in_content(output, check_strings_without_lines +
-                                              ["has_line_numbers: False"])
+                                      ["has_line_numbers: False"])
 
     def common_test_inferno(self):
-        self.run_cmd([inferno_script, "-h"])
+        self.run_cmd([INFERNO_SCRIPT, "-h"])
         remove("perf.data")
         append_args = [] if self.adb_root else ["--disable_adb_root"]
-        self.run_cmd([inferno_script, "-p", self.package_name, "-t", "3"] + append_args)
-        self.check_exist(file="perf.data")
-        self.run_cmd([inferno_script, "-p", self.package_name, "-f", "1000", "-du", "-t", "1",
-                      "-nc"] + append_args)
-        self.run_cmd([inferno_script, "-p", self.package_name, "-e", "100000 cpu-cycles",
-                      "-t", "1", "-nc"] + append_args)
-        self.run_cmd([inferno_script, "-sc"])
+        self.run_cmd([INFERNO_SCRIPT, "-p", self.package_name, "-t", "3"] + append_args)
+        self.check_exist(filename="perf.data")
+        self.run_cmd([INFERNO_SCRIPT, "-p", self.package_name, "-f", "1000", "-du", "-t", "1"] +
+                     append_args)
+        self.run_cmd([INFERNO_SCRIPT, "-p", self.package_name, "-e", "100000 cpu-cycles",
+                      "-t", "1"] + append_args)
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
 
     def common_test_report_html(self):
         self.run_cmd(['report_html.py', '-h'])
-        self.run_app_profiler(record_arg='-g -f 1000 --duration 3 -e task-clock:u')
         self.run_cmd(['report_html.py'])
         self.run_cmd(['report_html.py', '--add_source_code', '--source_dirs', 'testdata'])
         self.run_cmd(['report_html.py', '--add_disassembly'])
         # Test with multiple perf.data.
         shutil.move('perf.data', 'perf2.data')
-        self.run_app_profiler()
+        self.run_app_profiler(record_arg='-g -f 1000 --duration 3 -e task-clock:u')
         self.run_cmd(['report_html.py', '-i', 'perf.data', 'perf2.data'])
         remove('perf2.data')
 
@@ -347,11 +348,11 @@ class TestExamplePureJava(TestExampleBase):
         self.common_test_app_profiler()
 
     def test_app_profiler_profile_from_launch(self):
-        self.run_app_profiler(profile_from_launch=True, add_arch=True, build_binary_cache=False)
+        self.run_app_profiler(start_activity=True, build_binary_cache=False)
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run",
+            "__start_thread"])
 
     def test_app_profiler_multiprocesses(self):
         self.adb.check_run(['shell', 'am', 'force-stop', self.package_name])
@@ -359,7 +360,7 @@ class TestExamplePureJava(TestExampleBase):
                             self.package_name + '/.MultiProcessActivity'])
         # Wait until both MultiProcessActivity and MultiProcessService set up.
         time.sleep(3)
-        self.run_app_profiler(skip_compile=True, start_activity=False)
+        self.run_app_profiler(start_activity=False)
         self.run_cmd(["report.py", "-o", "report.txt"])
         self.check_strings_in_file("report.txt", ["BusyService", "BusyThread"])
 
@@ -369,7 +370,7 @@ class TestExamplePureJava(TestExampleBase):
         self.adb.check_run(['shell', 'am', 'start', '-n', self.package_name + '/.MainActivity'])
         time.sleep(1)
         args = [sys.executable, "app_profiler.py", "--app", self.package_name,
-                "-r", "--duration 10000", "-nc", "--disable_adb_root"]
+                "-r", "--duration 10000", "--disable_adb_root"]
         subproc = subprocess.Popen(args)
         time.sleep(3)
 
@@ -382,52 +383,74 @@ class TestExamplePureJava(TestExampleBase):
         self.adb.check_run(['shell', 'am', 'start', '-n', self.package_name + '/.MainActivity'])
         time.sleep(1)
         subproc = subprocess.Popen([sys.executable, 'app_profiler.py', '--app', self.package_name,
-                                    '-r', '--duration 10000', '-nc', '--disable_adb_root'])
+                                    '-r', '--duration 10000', '--disable_adb_root'])
         time.sleep(3)
         self.adb.check_run(['shell', 'am', 'force-stop', self.package_name])
         subproc.wait()
         self.assertEqual(subproc.returncode, 0)
         self.run_cmd(["report.py"])
 
+    def test_app_profiler_with_ndk_path(self):
+        # Although we pass an invalid ndk path, it should be able to find tools in default ndk path.
+        self.run_cmd(['app_profiler.py', '--app', self.package_name, '-a', self.activity_name,
+                      '--ndk_path', '.'])
+
     def test_report(self):
         self.common_test_report()
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run",
+            "__start_thread"])
+
+    def test_profile_with_process_id(self):
+        self.adb.check_run(['shell', 'am', 'start', '-n', self.package_name + '/.MainActivity'])
+        time.sleep(1)
+        pid = self.adb.check_run_and_return_output([
+            'shell', 'pidof', 'com.example.simpleperf.simpleperfexamplepurejava']).strip()
+        self.run_app_profiler(start_activity=False, record_arg='-g --duration 10 -p ' + pid)
+        self.run_cmd(["report.py", "-g", "-o", "report.txt"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run",
+            "__start_thread"])
 
     def test_annotate(self):
         self.common_test_annotate()
+        if not self.use_compiled_java_code:
+            # Currently annotating Java code is only supported when the Java code is compiled.
+            return
         self.check_file_under_dir("annotated_files", "MainActivity.java")
         summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("MainActivity.java", 80, 80),
-             ("run", 80, 0),
-             ("callFunction", 0, 0),
-             ("line 23", 80, 0)])
+        self.check_annotation_summary(summary_file, [
+            ("MainActivity.java", 80, 80),
+            ("run", 80, 0),
+            ("callFunction", 0, 0),
+            ("line 23", 80, 0)])
 
     def test_report_sample(self):
         self.common_test_report_sample(
-            ["com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()",
+            ["com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run",
              "__start_thread"])
 
     def test_pprof_proto_generator(self):
+        check_strings_with_lines = []
+        if self.use_compiled_java_code:
+            check_strings_with_lines = [
+                "com/example/simpleperf/simpleperfexamplepurejava/MainActivity.java",
+                "run"]
         self.common_test_pprof_proto_generator(
-            check_strings_with_lines=
-                ["com/example/simpleperf/simpleperfexamplepurejava/MainActivity.java",
-                 "run"],
-            check_strings_without_lines=
-                ["com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()"])
+            check_strings_with_lines=check_strings_with_lines,
+            check_strings_without_lines=[
+                "com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run"])
 
     def test_inferno(self):
         self.common_test_inferno()
         self.run_app_profiler()
-        self.run_cmd([inferno_script, "-sc"])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
         self.check_inferno_report_html(
-            [('com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()', 80)])
-        self.run_cmd([inferno_script, "-sc", "-o", "report2.html"])
+            [('com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run', 80)])
+        self.run_cmd([INFERNO_SCRIPT, "-sc", "-o", "report2.html"])
         self.check_inferno_report_html(
-            [('com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run()', 80)],
+            [('com.example.simpleperf.simpleperfexamplepurejava.MainActivity$1.run', 80)],
             "report2.html")
         remove("report2.html")
 
@@ -439,13 +462,23 @@ class TestExamplePureJava(TestExampleBase):
         os.chdir(test_dir)
         self.run_cmd(['python', os.path.join(saved_dir, 'app_profiler.py'),
                       '--app', self.package_name, '-r', '-e task-clock:u -g --duration 3'])
-        self.check_exist(file="perf.data")
-        self.run_cmd([inferno_script, "-sc"])
+        self.check_exist(filename="perf.data")
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
         os.chdir(saved_dir)
         remove(test_dir)
 
     def test_report_html(self):
         self.common_test_report_html()
+
+    def test_run_simpleperf_without_usb_connection(self):
+        self.adb.check_run(['shell', 'am', 'start', '-n', self.package_name + '/.MainActivity'])
+        self.run_cmd(['run_simpleperf_without_usb_connection.py', 'start', '-p',
+                      self.package_name, '--size_limit', '1M'])
+        self.adb.check_run(['kill-server'])
+        time.sleep(3)
+        self.run_cmd(['run_simpleperf_without_usb_connection.py', 'stop'])
+        self.check_exist(filename="perf.data")
+        self.run_cmd(["report.py", "-g", "-o", "report.txt"])
 
 
 class TestExamplePureJavaRoot(TestExampleBase):
@@ -468,31 +501,32 @@ class TestExamplePureJavaTraceOffCpu(TestExampleBase):
                     ".SleepActivity")
 
     def test_smoke(self):
-        self.run_app_profiler(record_arg="-g -f 1000 --duration 3 -e cpu-cycles:u --trace-offcpu")
+        self.run_app_profiler(record_arg="-g -f 1000 --duration 10 -e cpu-cycles:u --trace-offcpu")
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.run()",
-             "long com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.RunFunction()",
-             "long com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.SleepFunction(long)"
-             ])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.run",
+            "com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.RunFunction",
+            "com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.SleepFunction"
+            ])
         remove("annotated_files")
         self.run_cmd(["annotate.py", "-s", self.example_path])
-        self.check_exist(dir="annotated_files")
-        self.check_file_under_dir("annotated_files", "SleepActivity.java")
-        summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("SleepActivity.java", 80, 20),
-             ("run", 80, 0),
-             ("RunFunction", 20, 20),
-             ("SleepFunction", 20, 0),
-             ("line 24", 20, 0),
-             ("line 32", 20, 0)])
-        self.run_cmd([inferno_script, "-sc"])
+        self.check_exist(dirname="annotated_files")
+        if self.use_compiled_java_code:
+            self.check_file_under_dir("annotated_files", "SleepActivity.java")
+            summary_file = os.path.join("annotated_files", "summary")
+            self.check_annotation_summary(summary_file, [
+                ("SleepActivity.java", 80, 20),
+                ("run", 80, 0),
+                ("RunFunction", 20, 20),
+                ("SleepFunction", 20, 0),
+                ("line 24", 20, 0),
+                ("line 32", 20, 0)])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
         self.check_inferno_report_html(
-            [('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.run() ', 80),
-             ('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.RunFunction()',
+            [('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.run', 80),
+             ('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.RunFunction',
               20),
-             ('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.SleepFunction(long)',
+             ('com.example.simpleperf.simpleperfexamplepurejava.SleepActivity$1.SleepFunction',
               20)])
 
 
@@ -505,31 +539,25 @@ class TestExampleWithNative(TestExampleBase):
 
     def test_app_profiler(self):
         self.common_test_app_profiler()
-        remove("binary_cache")
-        self.run_app_profiler(native_lib_dir=self.example_path)
 
     def test_app_profiler_profile_from_launch(self):
-        self.run_app_profiler(profile_from_launch=True, add_arch=True, build_binary_cache=False)
+        self.run_app_profiler(start_activity=True, build_binary_cache=False)
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["BusyLoopThread",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", ["BusyLoopThread", "__start_thread"])
 
     def test_report(self):
         self.common_test_report()
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["BusyLoopThread",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", ["BusyLoopThread", "__start_thread"])
 
     def test_annotate(self):
         self.common_test_annotate()
         self.check_file_under_dir("annotated_files", "native-lib.cpp")
         summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("native-lib.cpp", 20, 0),
-             ("BusyLoopThread", 20, 0),
-             ("line 46", 20, 0)])
+        self.check_annotation_summary(summary_file, [
+            ("native-lib.cpp", 20, 0),
+            ("BusyLoopThread", 20, 0),
+            ("line 46", 20, 0)])
 
     def test_report_sample(self):
         self.common_test_report_sample(
@@ -538,16 +566,13 @@ class TestExampleWithNative(TestExampleBase):
 
     def test_pprof_proto_generator(self):
         self.common_test_pprof_proto_generator(
-            check_strings_with_lines=
-                ["native-lib.cpp",
-                 "BusyLoopThread"],
-            check_strings_without_lines=
-                ["BusyLoopThread"])
+            check_strings_with_lines=["native-lib.cpp", "BusyLoopThread"],
+            check_strings_without_lines=["BusyLoopThread"])
 
     def test_inferno(self):
         self.common_test_inferno()
         self.run_app_profiler()
-        self.run_cmd([inferno_script, "-sc"])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
         self.check_inferno_report_html([('BusyLoopThread', 20)])
 
     def test_report_html(self):
@@ -564,8 +589,6 @@ class TestExampleWithNativeRoot(TestExampleBase):
 
     def test_app_profiler(self):
         self.common_test_app_profiler()
-        remove("binary_cache")
-        self.run_app_profiler(native_lib_dir=self.example_path)
 
 
 class TestExampleWithNativeTraceOffCpu(TestExampleBase):
@@ -576,25 +599,25 @@ class TestExampleWithNativeTraceOffCpu(TestExampleBase):
                     ".SleepActivity")
 
     def test_smoke(self):
-        self.run_app_profiler(record_arg="-g -f 1000 --duration 3 -e cpu-cycles:u --trace-offcpu")
+        self.run_app_profiler(record_arg="-g -f 1000 --duration 10 -e cpu-cycles:u --trace-offcpu")
         self.run_cmd(["report.py", "-g", "--comms", "SleepThread", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["SleepThread(void*)",
-             "RunFunction()",
-             "SleepFunction(unsigned long long)"])
+        self.check_strings_in_file("report.txt", [
+            "SleepThread(void*)",
+            "RunFunction()",
+            "SleepFunction(unsigned long long)"])
         remove("annotated_files")
         self.run_cmd(["annotate.py", "-s", self.example_path, "--comm", "SleepThread"])
-        self.check_exist(dir="annotated_files")
+        self.check_exist(dirname="annotated_files")
         self.check_file_under_dir("annotated_files", "native-lib.cpp")
         summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("native-lib.cpp", 80, 20),
-             ("SleepThread", 80, 0),
-             ("RunFunction", 20, 20),
-             ("SleepFunction", 20, 0),
-             ("line 73", 20, 0),
-             ("line 83", 20, 0)])
-        self.run_cmd([inferno_script, "-sc"])
+        self.check_annotation_summary(summary_file, [
+            ("native-lib.cpp", 80, 20),
+            ("SleepThread", 80, 0),
+            ("RunFunction", 20, 20),
+            ("SleepFunction", 20, 0),
+            ("line 73", 20, 0),
+            ("line 83", 20, 0)])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
         self.check_inferno_report_html([('SleepThread', 80),
                                         ('RunFunction', 20),
                                         ('SleepFunction', 20)])
@@ -610,23 +633,26 @@ class TestExampleWithNativeJniCall(TestExampleBase):
     def test_smoke(self):
         self.run_app_profiler()
         self.run_cmd(["report.py", "-g", "--comms", "BusyThread", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["void com.example.simpleperf.simpleperfexamplewithnative.MixActivity$1.run()",
-             "int com.example.simpleperf.simpleperfexamplewithnative.MixActivity.callFunction(int)",
-             "Java_com_example_simpleperf_simpleperfexamplewithnative_MixActivity_callFunction"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexamplewithnative.MixActivity$1.run",
+            "com.example.simpleperf.simpleperfexamplewithnative.MixActivity.callFunction",
+            "Java_com_example_simpleperf_simpleperfexamplewithnative_MixActivity_callFunction"])
         remove("annotated_files")
         self.run_cmd(["annotate.py", "-s", self.example_path, "--comm", "BusyThread"])
-        self.check_exist(dir="annotated_files")
+        self.check_exist(dirname="annotated_files")
         self.check_file_under_dir("annotated_files", "native-lib.cpp")
-        self.check_file_under_dir("annotated_files", "MixActivity.java")
         summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("MixActivity.java", 80, 0),
-             ("run", 80, 0),
-             ("line 26", 20, 0),
-             ("native-lib.cpp", 5, 0),
-             ("line 40", 5, 0)])
-        self.run_cmd([inferno_script, "-sc"])
+        self.check_annotation_summary(summary_file, [("native-lib.cpp", 5, 0), ("line 40", 5, 0)])
+        if self.use_compiled_java_code:
+            self.check_file_under_dir("annotated_files", "MixActivity.java")
+            self.check_annotation_summary(summary_file, [
+                ("MixActivity.java", 80, 0),
+                ("run", 80, 0),
+                ("line 26", 20, 0),
+                ("native-lib.cpp", 5, 0),
+                ("line 40", 5, 0)])
+
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
 
 
 class TestExampleWithNativeForceArm(TestExampleWithNative):
@@ -668,50 +694,54 @@ class TestExampleOfKotlin(TestExampleBase):
         self.common_test_app_profiler()
 
     def test_app_profiler_profile_from_launch(self):
-        self.run_app_profiler(profile_from_launch=True, add_arch=True, build_binary_cache=False)
+        self.run_app_profiler(start_activity=True, build_binary_cache=False)
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1.run()",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1." +
+            "run", "__start_thread"])
 
     def test_report(self):
         self.common_test_report()
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1.run()",
-             "__start_thread"])
+        self.check_strings_in_file("report.txt", [
+            "com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1." +
+            "run", "__start_thread"])
 
     def test_annotate(self):
+        if not self.use_compiled_java_code:
+            return
         self.common_test_annotate()
         self.check_file_under_dir("annotated_files", "MainActivity.kt")
         summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("MainActivity.kt", 80, 80),
-             ("run", 80, 0),
-             ("callFunction", 0, 0),
-             ("line 19", 80, 0),
-             ("line 25", 0, 0)])
+        self.check_annotation_summary(summary_file, [
+            ("MainActivity.kt", 80, 80),
+            ("run", 80, 0),
+            ("callFunction", 0, 0),
+            ("line 19", 80, 0),
+            ("line 25", 0, 0)])
 
     def test_report_sample(self):
-        self.common_test_report_sample(
-            ["com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1.run()",
-             "__start_thread"])
+        self.common_test_report_sample([
+            "com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1." +
+            "run", "__start_thread"])
 
     def test_pprof_proto_generator(self):
+        check_strings_with_lines = []
+        if self.use_compiled_java_code:
+            check_strings_with_lines = [
+                "com/example/simpleperf/simpleperfexampleofkotlin/MainActivity.kt",
+                "run"]
         self.common_test_pprof_proto_generator(
-            check_strings_with_lines=
-                ["com/example/simpleperf/simpleperfexampleofkotlin/MainActivity.kt",
-                 "run"],
-            check_strings_without_lines=
-                ["com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1.run()"])
+            check_strings_with_lines=check_strings_with_lines,
+            check_strings_without_lines=["com.example.simpleperf.simpleperfexampleofkotlin." +
+                                         "MainActivity$createBusyThread$1.run"])
 
     def test_inferno(self):
         self.common_test_inferno()
         self.run_app_profiler()
-        self.run_cmd([inferno_script, "-sc"])
-        self.check_inferno_report_html(
-            [('com.example.simpleperf.simpleperfexampleofkotlin.MainActivity$createBusyThread$1.run()',
-              80)])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
+        self.check_inferno_report_html([('com.example.simpleperf.simpleperfexampleofkotlin.' +
+                                         'MainActivity$createBusyThread$1.run', 80)])
 
     def test_report_html(self):
         self.common_test_report_html()
@@ -737,67 +767,51 @@ class TestExampleOfKotlinTraceOffCpu(TestExampleBase):
                     ".SleepActivity")
 
     def test_smoke(self):
-        self.run_app_profiler(record_arg="-g -f 1000 --duration 3 -e cpu-cycles:u --trace-offcpu")
+        self.run_app_profiler(record_arg="-g -f 1000 --duration 10 -e cpu-cycles:u --trace-offcpu")
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-        self.check_strings_in_file("report.txt",
-            ["void com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.run()",
-             "long com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.RunFunction()",
-             "long com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.SleepFunction(long)"
-             ])
-        remove("annotated_files")
-        self.run_cmd(["annotate.py", "-s", self.example_path])
-        self.check_exist(dir="annotated_files")
-        self.check_file_under_dir("annotated_files", "SleepActivity.kt")
-        summary_file = os.path.join("annotated_files", "summary")
-        self.check_annotation_summary(summary_file,
-            [("SleepActivity.kt", 80, 20),
-             ("run", 80, 0),
-             ("RunFunction", 20, 20),
-             ("SleepFunction", 20, 0),
-             ("line 24", 20, 0),
-             ("line 32", 20, 0)])
-        self.run_cmd([inferno_script, "-sc"])
-        self.check_inferno_report_html(
-            [('void com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.run()',
-              80),
-             ('long com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.RunFunction()',
-              20),
-             ('long com.example.simpleperf.simpleperfexampleofkotlin.SleepActivity$createRunSleepThread$1.SleepFunction(long)',
-              20)])
+        function_prefix = "com.example.simpleperf.simpleperfexampleofkotlin." + \
+                          "SleepActivity$createRunSleepThread$1."
+        self.check_strings_in_file("report.txt", [
+            function_prefix + "run",
+            function_prefix + "RunFunction",
+            function_prefix + "SleepFunction"
+            ])
+        if self.use_compiled_java_code:
+            remove("annotated_files")
+            self.run_cmd(["annotate.py", "-s", self.example_path])
+            self.check_exist(dirname="annotated_files")
+            self.check_file_under_dir("annotated_files", "SleepActivity.kt")
+            summary_file = os.path.join("annotated_files", "summary")
+            self.check_annotation_summary(summary_file, [
+                ("SleepActivity.kt", 80, 20),
+                ("run", 80, 0),
+                ("RunFunction", 20, 20),
+                ("SleepFunction", 20, 0),
+                ("line 24", 20, 0),
+                ("line 32", 20, 0)])
+
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
+        self.check_inferno_report_html([
+            (function_prefix + 'run', 80),
+            (function_prefix + 'RunFunction', 20),
+            (function_prefix + 'SleepFunction', 20)])
 
 
-class TestProfilingNativeProgram(TestExampleBase):
-    def test_smoke(self):
-        if not AdbHelper().switch_to_root():
-            log_info('skip TestProfilingNativeProgram on non-rooted devices.')
-            return
-        remove("perf.data")
-        self.run_cmd(["app_profiler.py", "-np", "surfaceflinger",
-                      "-r", "-g -f 1000 --duration 3 -e cpu-cycles:u"])
-        self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-
-
-class TestProfilingCmd(TestExampleBase):
+class TestProfilingCmd(TestBase):
     def test_smoke(self):
         remove("perf.data")
         self.run_cmd(["app_profiler.py", "-cmd", "pm -l", "--disable_adb_root"])
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
 
-    def test_set_arch(self):
-        arch = AdbHelper().get_device_arch()
-        remove("perf.data")
-        self.run_cmd(["app_profiler.py", "-cmd", "pm -l", "--arch", arch])
-        self.run_cmd(["report.py", "-g", "-o", "report.txt"])
 
-
-class TestProfilingNativeProgram(TestExampleBase):
+class TestProfilingNativeProgram(TestBase):
     def test_smoke(self):
         adb = AdbHelper()
         if adb.switch_to_root():
             self.run_cmd(["app_profiler.py", "-np", "surfaceflinger"])
             self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-            self.run_cmd([inferno_script, "-sc"])
-            self.run_cmd([inferno_script, "-np", "surfaceflinger"])
+            self.run_cmd([INFERNO_SCRIPT, "-sc"])
+            self.run_cmd([INFERNO_SCRIPT, "-np", "surfaceflinger"])
 
 
 class TestReportLib(unittest.TestCase):
@@ -815,7 +829,6 @@ class TestReportLib(unittest.TestCase):
     def test_symbol(self):
         found_func2 = False
         while self.report_lib.GetNextSample():
-            sample = self.report_lib.GetCurrentSample()
             symbol = self.report_lib.GetSymbolOfCurrentSample()
             if symbol.symbol_name == 'func2(int, int)':
                 found_func2 = True
@@ -860,7 +873,8 @@ class TestReportLib(unittest.TestCase):
     def test_record_cmd(self):
         self.report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_trace_offcpu.data'))
         self.assertEqual(self.report_lib.GetRecordCmd(),
-                         "/data/local/tmp/simpleperf record --trace-offcpu --duration 2 -g ./simpleperf_runtest_run_and_sleep64")
+                         "/data/local/tmp/simpleperf record --trace-offcpu --duration 2 -g " +
+                         "./simpleperf_runtest_run_and_sleep64")
 
     def test_offcpu(self):
         self.report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_trace_offcpu.data'))
@@ -881,6 +895,44 @@ class TestReportLib(unittest.TestCase):
             self.assertEqual(self.report_lib.GetEventOfCurrentSample().name, 'cpu-cycles')
         sleep_percentage = float(sleep_function_period) / total_period
         self.assertGreater(sleep_percentage, 0.30)
+
+    def test_show_art_frames(self):
+        def has_art_frame(report_lib):
+            report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_interpreter_frames.data'))
+            result = False
+            while report_lib.GetNextSample():
+                callchain = report_lib.GetCallChainOfCurrentSample()
+                for i in range(callchain.nr):
+                    if callchain.entries[i].symbol.symbol_name == 'artMterpAsmInstructionStart':
+                        result = True
+                        break
+            report_lib.Close()
+            return result
+
+        report_lib = ReportLib()
+        self.assertFalse(has_art_frame(report_lib))
+        report_lib = ReportLib()
+        report_lib.ShowArtFrames(False)
+        self.assertFalse(has_art_frame(report_lib))
+        report_lib = ReportLib()
+        report_lib.ShowArtFrames(True)
+        self.assertTrue(has_art_frame(report_lib))
+
+    def test_tracing_data(self):
+        self.report_lib.SetRecordFile(os.path.join('testdata', 'perf_with_tracepoint_event.data'))
+        has_tracing_data = False
+        while self.report_lib.GetNextSample():
+            event = self.report_lib.GetEventOfCurrentSample()
+            tracing_data = self.report_lib.GetTracingDataOfCurrentSample()
+            if event.name == 'sched:sched_switch':
+                self.assertIsNotNone(tracing_data)
+                self.assertIn('prev_pid', tracing_data)
+                self.assertIn('next_comm', tracing_data)
+                if tracing_data['prev_pid'] == 9896 and tracing_data['next_comm'] == 'swapper/4':
+                    has_tracing_data = True
+            else:
+                self.assertIsNone(tracing_data)
+        self.assertTrue(has_tracing_data)
 
 
 class TestRunSimpleperfOnDevice(TestBase):
@@ -965,8 +1017,7 @@ class TestTools(unittest.TestCase):
                 actual_source = addr2line.get_addr_source(dso, test_addr['addr'])
                 self.assertTrue(actual_source is not None)
                 self.assertEqual(len(actual_source), len(expected_source))
-                for i in range(len(expected_source)):
-                    actual_file_path, actual_line = actual_source[i]
+                for i, (actual_file_path, actual_line) in enumerate(expected_source):
                     self.assertEqual(actual_file_path, expected_source[i][0])
                     self.assertEqual(actual_line, expected_source[i][1])
 
@@ -1019,14 +1070,113 @@ class TestTools(unittest.TestCase):
             for item in dso_info['expected_items']:
                 self.assertTrue(item in disassemble_code)
 
+    def test_readelf(self):
+        test_map = {
+            '/simpleperf_runtest_two_functions_arm64': {
+                'arch': 'arm64',
+                'build_id': '0xe8ecb3916d989dbdc068345c30f0c24300000000',
+                'sections': ['.interp', '.note.android.ident', '.note.gnu.build-id', '.dynsym',
+                             '.dynstr', '.gnu.hash', '.gnu.version', '.gnu.version_r', '.rela.dyn',
+                             '.rela.plt', '.plt', '.text', '.rodata', '.eh_frame', '.eh_frame_hdr',
+                             '.preinit_array', '.init_array', '.fini_array', '.dynamic', '.got',
+                             '.got.plt', '.data', '.bss', '.comment', '.debug_str', '.debug_loc',
+                             '.debug_abbrev', '.debug_info', '.debug_ranges', '.debug_macinfo',
+                             '.debug_pubnames', '.debug_pubtypes', '.debug_line',
+                             '.note.gnu.gold-version', '.symtab', '.strtab', '.shstrtab'],
+            },
+            '/simpleperf_runtest_two_functions_arm': {
+                'arch': 'arm',
+                'build_id': '0x718f5b36c4148ee1bd3f51af89ed2be600000000',
+            },
+            '/simpleperf_runtest_two_functions_x86_64': {
+                'arch': 'x86_64',
+            },
+            '/simpleperf_runtest_two_functions_x86': {
+                'arch': 'x86',
+            }
+        }
+        readelf = ReadElf(None)
+        for dso_path in test_map:
+            dso_info = test_map[dso_path]
+            path = 'testdata' + dso_path
+            self.assertEqual(dso_info['arch'], readelf.get_arch(path))
+            if 'build_id' in dso_info:
+                self.assertEqual(dso_info['build_id'], readelf.get_build_id(path))
+            if 'sections' in dso_info:
+                self.assertEqual(dso_info['sections'], readelf.get_sections(path))
+        self.assertEqual(readelf.get_arch('not_exist_file'), 'unknown')
+        self.assertEqual(readelf.get_build_id('not_exist_file'), '')
+        self.assertEqual(readelf.get_sections('not_exist_file'), [])
+
+
+class TestNativeLibDownloader(unittest.TestCase):
+    def test_smoke(self):
+        adb = AdbHelper()
+
+        def is_lib_on_device(path):
+            return adb.run(['shell', 'ls', path])
+
+        # Sync all native libs on device.
+        adb.run(['shell', 'rm', '-rf', '/data/local/tmp/native_libs'])
+        downloader = NativeLibDownloader(None, 'arm64', adb)
+        downloader.collect_native_libs_on_host(os.path.join(
+            'testdata', 'SimpleperfExampleWithNative', 'app', 'build', 'intermediates', 'cmake',
+            'profiling'))
+        self.assertEqual(len(downloader.host_build_id_map), 2)
+        for entry in downloader.host_build_id_map.values():
+            self.assertEqual(entry.score, 3)
+        downloader.collect_native_libs_on_device()
+        self.assertEqual(len(downloader.device_build_id_map), 0)
+
+        lib_list = downloader.host_build_id_map.items()
+        for sync_count in [0, 1, 2]:
+            build_id_map = {}
+            for i in range(sync_count):
+                build_id_map[lib_list[i][0]] = lib_list[i][1]
+            downloader.host_build_id_map = build_id_map
+            downloader.sync_natives_libs_on_device()
+            downloader.collect_native_libs_on_device()
+            self.assertEqual(len(downloader.device_build_id_map), sync_count)
+            for i, item in enumerate(lib_list):
+                build_id = item[0]
+                name = item[1].name
+                if i < sync_count:
+                    self.assertTrue(build_id in downloader.device_build_id_map)
+                    self.assertEqual(name, downloader.device_build_id_map[build_id])
+                    self.assertTrue(is_lib_on_device(downloader.dir_on_device + name))
+                else:
+                    self.assertTrue(build_id not in downloader.device_build_id_map)
+                    self.assertFalse(is_lib_on_device(downloader.dir_on_device + name))
+            if sync_count == 1:
+                adb.run(['pull', '/data/local/tmp/native_libs/build_id_list', 'build_id_list'])
+                with open('build_id_list', 'rb') as fh:
+                    self.assertEqual(fh.read(), '{}={}\n'.format(lib_list[0][0],
+                                                                 lib_list[0][1].name))
+                remove('build_id_list')
+        adb.run(['shell', 'rm', '-rf', '/data/local/tmp/native_libs'])
+
+
+def list_tests():
+    tests = []
+    for name, value in globals().items():
+        if isinstance(value, type) and issubclass(value, unittest.TestCase):
+            test_methods = [x for x, y in value.__dict__.items()
+                            if isinstance(y, types.FunctionType) and x.startswith('test')]
+            for method in test_methods:
+                tests.append(name + '.' + method)
+    print(' '.join(sorted(tests)))
+
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--list-tests':
+        list_tests()
+        return
     os.chdir(get_script_dir())
     build_testdata()
     if AdbHelper().get_android_version() < 7:
         log_info("Skip tests on Android version < N.")
         sys.exit(0)
-    unittest.main(failfast=True)
+    unittest.main(failfast=True, verbosity=2)
 
 if __name__ == '__main__':
     main()

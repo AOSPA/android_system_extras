@@ -111,14 +111,17 @@ libsimpleperf_src_files_linux := \
   cmd_list.cpp \
   cmd_record.cpp \
   cmd_stat.cpp \
+  cmd_trace_sched.cpp \
   environment.cpp \
   event_fd.cpp \
   event_selection_set.cpp \
   InplaceSamplerClient.cpp \
   IOEventLoop.cpp \
+  JITDebugReader.cpp \
   OfflineUnwinder.cpp \
-  perf_clock.cpp \
+  read_dex_file.cpp \
   record_file_writer.cpp \
+  RecordReadThread.cpp \
   UnixSocket.cpp \
   workload.cpp \
 
@@ -142,6 +145,8 @@ LOCAL_STATIC_LIBRARIES := $(simpleperf_static_libraries_target)
 LOCAL_MULTILIB := both
 LOCAL_PROTOC_OPTIMIZE_TYPE := lite-static
 include $(LLVM_DEVICE_BUILD_MK)
+# Remove -std=c++11 flag to compile read_dex_file.cpp.
+LOCAL_CPPFLAGS := $(filter-out $(LOCAL_CPPFLAGS),-std=c++11)
 include $(BUILD_STATIC_LIBRARY)
 
 # libsimpleperf host
@@ -163,6 +168,8 @@ LOCAL_MULTILIB := both
 LOCAL_PROTOC_OPTIMIZE_TYPE := lite-static
 LOCAL_CXX_STL := libc++_static
 include $(LLVM_HOST_BUILD_MK)
+# Remove -std=c++11 flag to compile read_dex_file.cpp.
+LOCAL_CPPFLAGS := $(filter-out $(LOCAL_CPPFLAGS),-std=c++11)
 include $(BUILD_HOST_STATIC_LIBRARY)
 
 
@@ -355,11 +362,13 @@ simpleperf_unit_test_src_files := \
   cmd_report_test.cpp \
   cmd_report_sample_test.cpp \
   command_test.cpp \
+  dso_test.cpp \
   gtest_main.cpp \
   read_apk_test.cpp \
   read_elf_test.cpp \
   record_test.cpp \
   sample_tree_test.cpp \
+  thread_tree_test.cpp \
   utils_test.cpp \
 
 simpleperf_unit_test_src_files_linux := \
@@ -369,9 +378,12 @@ simpleperf_unit_test_src_files_linux := \
   cmd_list_test.cpp \
   cmd_record_test.cpp \
   cmd_stat_test.cpp \
+  cmd_trace_sched_test.cpp \
   environment_test.cpp \
   IOEventLoop_test.cpp \
+  read_dex_file_test.cpp \
   record_file_test.cpp \
+  RecordReadThread_test.cpp \
   UnixSocket_test.cpp \
   workload_test.cpp \
 
@@ -384,7 +396,7 @@ LOCAL_SRC_FILES := \
   $(simpleperf_unit_test_src_files) \
   $(simpleperf_unit_test_src_files_linux) \
 
-LOCAL_STATIC_LIBRARIES += libsimpleperf $(simpleperf_static_libraries_with_libc_target)
+LOCAL_STATIC_LIBRARIES += libsimpleperf $(simpleperf_static_libraries_with_libc_target) libgmock
 LOCAL_TEST_DATA := $(call find-test-data-in-subdirs,$(LOCAL_PATH),"*",testdata)
 LOCAL_MULTILIB := both
 LOCAL_FORCE_STATIC_EXECUTABLE := true
@@ -402,7 +414,7 @@ LOCAL_CFLAGS_windows := $(simpleperf_cflags_host_windows)
 LOCAL_SRC_FILES := $(simpleperf_unit_test_src_files)
 LOCAL_SRC_FILES_linux := $(simpleperf_unit_test_src_files_linux)
 LOCAL_STATIC_LIBRARIES := libsimpleperf $(simpleperf_static_libraries_host)
-LOCAL_STATIC_LIBRARIES_linux := $(simpleperf_static_libraries_host_linux)
+LOCAL_STATIC_LIBRARIES_linux := $(simpleperf_static_libraries_host_linux) libgmock
 LOCAL_LDLIBS_linux := $(simpleperf_ldlibs_host_linux)
 LOCAL_MULTILIB := both
 include $(LLVM_HOST_BUILD_MK)
@@ -455,9 +467,12 @@ LOCAL_MODULE := libsimpleperf_cts_test
 LOCAL_CFLAGS := $(simpleperf_cflags_target) -DRUN_IN_APP_CONTEXT="\"com.android.simpleperf\""
 LOCAL_SRC_FILES := $(libsimpleperf_cts_test_src_files)
 LOCAL_STATIC_LIBRARIES := $(simpleperf_static_libraries_target)
+LOCAL_WHOLE_STATIC_LIBRARIES := libgmock
 LOCAL_MULTILIB := both
 LOCAL_FORCE_STATIC_EXECUTABLE := true
 include $(LLVM_DEVICE_BUILD_MK)
+# Remove -std=c++11 flag to compile read_dex_file.cpp.
+LOCAL_CPPFLAGS := $(filter-out $(LOCAL_CPPFLAGS),-std=c++11)
 include $(BUILD_STATIC_TEST_LIBRARY)
 
 # libsimpleperf_cts_test linux host
@@ -469,9 +484,12 @@ LOCAL_CFLAGS_linux := $(simpleperf_cflags_host_linux)
 LOCAL_SRC_FILES := $(libsimpleperf_cts_test_src_files)
 LOCAL_STATIC_LIBRARIES := $(simpleperf_static_libraries_host)
 LOCAL_STATIC_LIBRARIES_linux := $(simpleperf_static_libraries_host_linux)
+LOCAL_WHOLE_STATIC_LIBRARIES := libgmock
 LOCAL_LDLIBS_linux := $(simpleperf_ldlibs_host_linux)
 LOCAL_MULTILIB := both
 include $(LLVM_HOST_BUILD_MK)
+# Remove -std=c++11 flag to compile read_dex_file.cpp.
+LOCAL_CPPFLAGS := $(filter-out $(LOCAL_CPPFLAGS),-std=c++11)
 include $(BUILD_HOST_STATIC_TEST_LIBRARY)
 
 # simpleperf_record_test
@@ -517,7 +535,8 @@ SIMPLEPERF_SCRIPT_LIST := \
     $(call all-named-files-under,*.kt,demo) \
     testdata/perf_with_symbols.data \
     testdata/perf_with_trace_offcpu.data \
-    testdata/perf_with_tracepoint_event.data
+    testdata/perf_with_tracepoint_event.data \
+    testdata/perf_with_interpreter_frames.data
 
 SIMPLEPERF_SCRIPT_LIST := $(addprefix -f $(LOCAL_PATH)/,$(SIMPLEPERF_SCRIPT_LIST))
 

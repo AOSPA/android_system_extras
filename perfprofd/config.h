@@ -20,8 +20,7 @@
 
 #include <cstdint>
 #include <string>
-
-#include <unistd.h>
+#include <vector>
 
 struct Config {
   virtual ~Config() {}
@@ -42,8 +41,7 @@ struct Config {
   // the whole system will be profiled.
   int32_t process = -1;
 
-  // Destination directory (where to write profiles). This location
-  // chosen since it is accessible to the uploader service.
+  // Destination directory (where to write profiles).
   std::string destination_directory = "/data/misc/perfprofd";
   // Config directory (where to read configs).
   std::string config_directory = "/data/data/com.google.android.gms/files";
@@ -102,6 +100,13 @@ struct Config {
 
   // If true, send the proto to dropbox instead to a file.
   bool send_to_dropbox = false;
+
+  struct PerfCounterConfigElem {
+    std::vector<std::string> events;
+    bool group;
+    uint32_t sampling_period;
+  };
+  std::vector<PerfCounterConfigElem> event_config;
 
   // Sleep for the given number of seconds.
   virtual void Sleep(size_t seconds) = 0;

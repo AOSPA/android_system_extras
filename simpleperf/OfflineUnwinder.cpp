@@ -23,6 +23,7 @@
 #include <unwindstack/MachineArm64.h>
 #include <unwindstack/MachineX86.h>
 #include <unwindstack/MachineX86_64.h>
+#include <unwindstack/Maps.h>
 #include <unwindstack/Regs.h>
 #include <unwindstack/RegsArm.h>
 #include <unwindstack/RegsArm64.h>
@@ -37,6 +38,10 @@
 #include "perf_regs.h"
 #include "read_apk.h"
 #include "thread_tree.h"
+
+static_assert(simpleperf::map_flags::PROT_JIT_SYMFILE_MAP == PROT_JIT_SYMFILE_MAP, "");
+static_assert(simpleperf::map_flags::PROT_JIT_SYMFILE_MAP ==
+              unwindstack::MAPS_FLAGS_JIT_SYMFILE_MAP, "");
 
 namespace simpleperf {
 
@@ -131,30 +136,30 @@ bool OfflineUnwinder::UnwindCallChain(const ThreadEntry& thread, const RegSet& r
   auto map_it = cached_maps_.find(thread.pid);
   CachedMap& cached_map = (map_it == cached_maps_.end() ? cached_maps_[thread.pid]
                                                         : map_it->second);
-  if (cached_map.version < thread.maps->version) {
+  if (!cached_map.map || cached_map.version < thread.maps->version) {
     std::vector<backtrace_map_t> bt_maps(thread.maps->maps.size());
     size_t map_index = 0;
-    for (auto& map : thread.maps->maps) {
+    for (auto& pair : thread.maps->maps) {
+      const MapEntry* map = pair.second;
       backtrace_map_t& bt_map = bt_maps[map_index++];
       bt_map.start = map->start_addr;
       bt_map.end = map->start_addr + map->len;
       bt_map.offset = map->pgoff;
       bt_map.name = map->dso->GetDebugFilePath();
       if (bt_map.offset == 0) {
-        size_t apk_pos = bt_map.name.find_last_of('!');
-        if (apk_pos != std::string::npos) {
+        auto tuple = SplitUrlInApk(bt_map.name);
+        if (std::get<0>(tuple)) {
           // The unwinder does not understand the ! format, so change back to
           // the previous format (apk, offset).
-          std::string shared_lib(bt_map.name.substr(apk_pos + 2));
-          bt_map.name = bt_map.name.substr(0, apk_pos);
-          uint64_t offset;
-          uint32_t length;
-          if (ApkInspector::FindOffsetInApkByName(bt_map.name, shared_lib, &offset, &length)) {
-            bt_map.offset = offset;
+          EmbeddedElf* elf = ApkInspector::FindElfInApkByName(std::get<1>(tuple),
+                                                              std::get<2>(tuple));
+          if (elf != nullptr) {
+            bt_map.name = elf->filepath();
+            bt_map.offset = elf->entry_offset();
           }
         }
       }
-      bt_map.flags = PROT_READ | PROT_EXEC;
+      bt_map.flags = PROT_READ | PROT_EXEC | map->flags;
     }
     cached_map.map.reset(BacktraceMap::CreateOffline(thread.pid, bt_maps));
     if (!cached_map.map) {
@@ -176,10 +181,18 @@ bool OfflineUnwinder::UnwindCallChain(const ThreadEntry& thread, const RegSet& r
   }
   std::vector<backtrace_frame_data_t> frames;
   BacktraceUnwindError error;
-  if (Backtrace::UnwindOffline(unwind_regs.get(), cached_map.map.get(), stack_info, &frames, &error)) {
+  if (Backtrace::UnwindOffline(unwind_regs.get(), cached_map.map.get(), stack_info, &frames,
+                               &error)) {
     for (auto& frame : frames) {
       // Unwinding in arm architecture can return 0 pc address.
-      if (frame.pc == 0) {
+
+      // If frame.map.start == 0, this frame doesn't hit any map, it could be:
+      // 1. In an executable map not backed by a file. Note that RecordCommand::ShouldOmitRecord()
+      //    may omit maps only exist memory.
+      // 2. An incorrectly unwound frame. Like caused by invalid stack data, as in
+      //    SampleRecord::GetValidStackSize().
+      // We want to remove this frame and callchains following it in either case.
+      if (frame.pc == 0 || frame.map.start == 0) {
         break;
       }
       ips->push_back(frame.pc);

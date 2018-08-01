@@ -18,6 +18,7 @@
 
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <android-base/test_utils.h>
 
 #include <thread>
@@ -51,7 +52,28 @@ TEST(stat_cmd, tracepoint_event) {
       StatCmd()->Run({"-a", "-e", "sched:sched_switch", "sleep", "1"})));
 }
 
+TEST(stat_cmd, rN_event) {
+  TEST_REQUIRE_HW_COUNTER();
+  OMIT_TEST_ON_NON_NATIVE_ABIS();
+  size_t event_number;
+  if (GetBuildArch() == ARCH_ARM64 || GetBuildArch() == ARCH_ARM) {
+    // As in D5.10.2 of the ARMv8 manual, ARM defines the event number space for PMU. part of the
+    // space is for common event numbers (which will stay the same for all ARM chips), part of the
+    // space is for implementation defined events. Here 0x08 is a common event for instructions.
+    event_number = 0x08;
+  } else if (GetBuildArch() == ARCH_X86_32 || GetBuildArch() == ARCH_X86_64) {
+    // As in volume 3 chapter 19 of the Intel manual, 0x00c0 is the event number for instruction.
+    event_number = 0x00c0;
+  } else {
+    GTEST_LOG_(INFO) << "Omit arch " << GetBuildArch();
+    return;
+  }
+  std::string event_name = android::base::StringPrintf("r%zx", event_number);
+  ASSERT_TRUE(StatCmd()->Run({"-e", event_name, "sleep", "1"}));
+}
+
 TEST(stat_cmd, event_modifier) {
+  TEST_REQUIRE_HW_COUNTER();
   ASSERT_TRUE(
       StatCmd()->Run({"-e", "cpu-cycles:u,cpu-cycles:k", "sleep", "1"}));
 }
@@ -100,9 +122,14 @@ TEST(stat_cmd, existing_threads) {
   ASSERT_TRUE(StatCmd()->Run({"-t", tid_list, "sleep", "1"}));
 }
 
-TEST(stat_cmd, no_monitored_threads) { ASSERT_FALSE(StatCmd()->Run({""})); }
+TEST(stat_cmd, no_monitored_threads) {
+  ScopedAppPackageName scoped_package_name("");
+  ASSERT_FALSE(StatCmd()->Run({}));
+  ASSERT_FALSE(StatCmd()->Run({""}));
+}
 
 TEST(stat_cmd, group_option) {
+  TEST_REQUIRE_HW_COUNTER();
   ASSERT_TRUE(
       StatCmd()->Run({"--group", "cpu-clock,page-faults", "sleep", "1"}));
   ASSERT_TRUE(StatCmd()->Run({"--group", "cpu-cycles,instructions", "--group",
@@ -111,6 +138,7 @@ TEST(stat_cmd, group_option) {
 }
 
 TEST(stat_cmd, auto_generated_summary) {
+  TEST_REQUIRE_HW_COUNTER();
   TemporaryFile tmp_file;
   ASSERT_TRUE(StatCmd()->Run({"--group", "instructions:u,instructions:k", "-o",
                               tmp_file.path, "sleep", "1"}));
@@ -145,11 +173,17 @@ TEST(stat_cmd, interval_option) {
     pos += subs.size();
     ++count ;
   }
-  ASSERT_EQ(count, 3UL);
+  ASSERT_EQ(count, 2UL);
 }
 
 TEST(stat_cmd, interval_option_in_system_wide) {
   TEST_IN_ROOT(ASSERT_TRUE(StatCmd()->Run({"-a", "--interval", "100", "--duration", "0.3"})));
+}
+
+TEST(stat_cmd, interval_only_values_option) {
+  ASSERT_TRUE(StatCmd()->Run({"--interval", "500", "--interval-only-values", "sleep", "2"}));
+  TEST_IN_ROOT(ASSERT_TRUE(StatCmd()->Run({"-a", "--interval", "100", "--interval-only-values",
+                                           "--duration", "0.3"})));
 }
 
 TEST(stat_cmd, no_modifier_for_clock_events) {
@@ -162,6 +196,8 @@ TEST(stat_cmd, no_modifier_for_clock_events) {
 }
 
 TEST(stat_cmd, handle_SIGHUP) {
+  // See http://b/79495636.
+  ScopedAppPackageName scoped_package_name("");
   std::thread thread([]() {
     sleep(1);
     kill(getpid(), SIGHUP);
@@ -182,6 +218,7 @@ TEST(stat_cmd, stop_when_no_more_targets) {
 }
 
 TEST(stat_cmd, sample_speed_should_be_zero) {
+  TEST_REQUIRE_HW_COUNTER();
   EventSelectionSet set(true);
   ASSERT_TRUE(set.AddEventType("cpu-cycles"));
   set.AddMonitoredProcesses({getpid()});
@@ -193,4 +230,29 @@ TEST(stat_cmd, sample_speed_should_be_zero) {
     ASSERT_EQ(attr.attr->sample_freq, 0u);
     ASSERT_EQ(attr.attr->freq, 0u);
   }
+}
+
+TEST(stat_cmd, calculating_cpu_frequency) {
+  TEST_REQUIRE_HW_COUNTER();
+  CaptureStdout capture;
+  ASSERT_TRUE(capture.Start());
+  ASSERT_TRUE(StatCmd()->Run({"--csv", "--group", "task-clock,cpu-cycles", "sleep", "1"}));
+  std::string output = capture.Finish();
+  double task_clock_in_ms = 0;
+  uint64_t cpu_cycle_count = 0;
+  double cpu_frequency = 0;
+  for (auto& line : android::base::Split(output, "\n")) {
+    if (line.find("task-clock") != std::string::npos) {
+      ASSERT_EQ(sscanf(line.c_str(), "%lf(ms)", &task_clock_in_ms), 1);
+    } else if (line.find("cpu-cycles") != std::string::npos) {
+      ASSERT_EQ(sscanf(line.c_str(), "%" SCNu64 ",cpu-cycles,%lf", &cpu_cycle_count,
+                       &cpu_frequency), 2);
+    }
+  }
+  ASSERT_NE(task_clock_in_ms, 0.0f);
+  ASSERT_NE(cpu_cycle_count, 0u);
+  ASSERT_NE(cpu_frequency, 0.0f);
+  double calculated_frequency = cpu_cycle_count / task_clock_in_ms / 1e6;
+  // Accept error up to 1e-3. Because the stat cmd print values with precision 1e-6.
+  ASSERT_NEAR(cpu_frequency, calculated_frequency, 1e-3);
 }
