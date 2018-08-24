@@ -89,6 +89,7 @@ class ReportSampleCommand : public Command {
 "--remove-unknown-kernel-symbols  Remove kernel callchains when kernel symbols\n"
 "                                 are not available in perf.data.\n"
 "--show-art-frames  Show frames of internal methods in the ART Java interpreter.\n"
+"--symdir <dir>     Look for files with symbols in a directory recursively.\n"
             // clang-format on
             ),
         record_filename_("perf.data"),
@@ -261,6 +262,13 @@ bool ReportSampleCommand::ParseOptions(const std::vector<std::string>& args) {
       remove_unknown_kernel_symbols_ = true;
     } else if (args[i] == "--show-art-frames") {
       show_art_frames_ = true;
+    } else if (args[i] == "--symdir") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      if (!Dso::AddSymbolDir(args[i])) {
+        return false;
+      }
     } else {
       ReportUnknownOption(args, i);
       return false;
@@ -504,7 +512,7 @@ bool ReportSampleCommand::ProcessSampleRecord(const SampleRecord& r) {
     }
     if (!show_art_frames_) {
       // Remove interpreter frames both before and after the Java frame.
-      if (entry.dso->type() == DSO_DEX_FILE) {
+      if (entry.dso->IsForJavaMethod()) {
         near_java_method = true;
         while (!entries.empty() && is_entry_for_interpreter(entries.back())) {
           entries.pop_back();

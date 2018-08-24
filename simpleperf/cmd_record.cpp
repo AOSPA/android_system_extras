@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <libgen.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -178,6 +179,8 @@ class RecordCommand : public Command {
 "                the kernel. It should be a power of 2. If not set, the max\n"
 "                possible value <= 1024 will be used.\n"
 "--no-inherit  Don't record created child threads/processes.\n"
+"--cpu-percent <percent>  Set the max percent of cpu time used for recording.\n"
+"                         percent is in range [1-100], default is 25.\n"
 "\n"
 "Dwarf unwinding options:\n"
 "--post-unwind=(yes|no) If `--call-graph dwarf` option is used, then the user's\n"
@@ -255,6 +258,7 @@ class RecordCommand : public Command {
  private:
   bool ParseOptions(const std::vector<std::string>& args,
                     std::vector<std::string>* non_option_args);
+  bool AdjustPerfEventLimit();
   bool PrepareRecording(Workload* workload);
   bool DoRecording(Workload* workload);
   bool PostProcessRecording(const std::vector<std::string>& args);
@@ -277,7 +281,7 @@ class RecordCommand : public Command {
   bool ProcessJITDebugInfo(const std::vector<JITSymFile>& jit_symfiles,
                            const std::vector<DexSymFile>& dex_symfiles, bool sync_kernel_records);
 
-  void UpdateRecordForEmbeddedPath(Record* record);
+  void UpdateRecord(Record* record);
   bool UnwindRecord(SampleRecord& r);
   bool PostUnwindRecords();
   bool JoinCallChains();
@@ -318,6 +322,8 @@ class RecordCommand : public Command {
   bool trace_offcpu_;
   bool exclude_kernel_callchain_;
   uint64_t size_limit_in_bytes_ = 0;
+  uint64_t max_sample_freq_ = DEFAULT_SAMPLE_FREQ_FOR_NONTRACEPOINT_EVENT;
+  size_t cpu_time_max_percent_ = 25;
 
   // For CallChainJoiner
   bool allow_callchain_joiner_;
@@ -341,6 +347,9 @@ bool RecordCommand::Run(const std::vector<std::string>& args) {
 
   std::vector<std::string> workload_args;
   if (!ParseOptions(args, &workload_args)) {
+    return false;
+  }
+  if (!AdjustPerfEventLimit()) {
     return false;
   }
   ScopedTempFiles scoped_temp_files(android::base::Dirname(record_filename_));
@@ -621,7 +630,12 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
       if (args[i-1] == "-c") {
         sample_speed_.reset(new SampleSpeed(0, value));
       } else {
+        if (value >= INT_MAX) {
+          LOG(ERROR) << "sample freq can't be bigger than INT_MAX.";
+          return false;
+        }
         sample_speed_.reset(new SampleSpeed(value, 0));
+        max_sample_freq_ = std::max(max_sample_freq_, value);
       }
       for (auto group_id : wait_setting_speed_event_groups_) {
         event_selection_set_.SetSampleSpeed(group_id, *sample_speed_);
@@ -683,6 +697,10 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
         return false;
       }
       cpus_ = GetCpusFromString(args[i]);
+    } else if (args[i] == "--cpu-percent") {
+      if (!GetUintOption(args, &i, &cpu_time_max_percent_, 1, 100)) {
+        return false;
+      }
     } else if (args[i] == "--duration") {
       if (!GetDoubleOption(args, &i, &duration_in_sec_, 1e-9)) {
         return false;
@@ -872,6 +890,35 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
   return true;
 }
 
+bool RecordCommand::AdjustPerfEventLimit() {
+  bool set_prop = false;
+  // 1. Adjust max_sample_rate.
+  uint64_t cur_max_freq;
+  if (GetMaxSampleFrequency(&cur_max_freq) && cur_max_freq < max_sample_freq_ &&
+      !SetMaxSampleFrequency(max_sample_freq_)) {
+    set_prop = true;
+  }
+  // 2. Adjust perf_cpu_time_max_percent.
+  size_t cur_percent;
+  if (GetCpuTimeMaxPercent(&cur_percent) && cur_percent != cpu_time_max_percent_ &&
+      !SetCpuTimeMaxPercent(cpu_time_max_percent_)) {
+    set_prop = true;
+  }
+  // 3. Adjust perf_event_mlock_kb.
+  uint64_t mlock_kb = sysconf(_SC_NPROCESSORS_CONF) * (mmap_page_range_.second + 1) * 4;
+  uint64_t cur_mlock_kb;
+  if (GetPerfEventMlockKb(&cur_mlock_kb) && cur_mlock_kb < mlock_kb &&
+      !SetPerfEventMlockKb(mlock_kb)) {
+    set_prop = true;
+  }
+
+  if (GetAndroidVersion() >= kAndroidVersionP + 1 && set_prop) {
+    return SetPerfEventLimits(std::max(max_sample_freq_, cur_max_freq), cpu_time_max_percent_,
+                              std::max(mlock_kb, cur_mlock_kb));
+  }
+  return true;
+}
+
 bool RecordCommand::TraceOffCpu() {
   if (FindEventTypeByName("sched:sched_switch") == nullptr) {
     LOG(ERROR) << "Can't trace off cpu because sched:sched_switch event is not available";
@@ -1037,8 +1084,8 @@ bool RecordCommand::DumpProcessMaps(pid_t pid, const std::unordered_set<pid_t>& 
     }
   }
   // Dump process name.
-  std::string name;
-  if (GetThreadName(pid, &name)) {
+  std::string name = GetCompleteProcessName(pid);
+  if (!name.empty()) {
     CommRecord record(attr, pid, pid, name, event_id, last_record_timestamp_);
     if (!ProcessRecord(&record)) {
       return false;
@@ -1057,7 +1104,7 @@ bool RecordCommand::DumpProcessMaps(pid_t pid, const std::unordered_set<pid_t>& 
 }
 
 bool RecordCommand::ProcessRecord(Record* record) {
-  UpdateRecordForEmbeddedPath(record);
+  UpdateRecord(record);
   if (ShouldOmitRecord(record)) {
     return true;
   }
@@ -1241,12 +1288,20 @@ void UpdateMmapRecordForEmbeddedPath(RecordType& r, bool has_prot, uint32_t prot
   }
 }
 
-void RecordCommand::UpdateRecordForEmbeddedPath(Record* record) {
+void RecordCommand::UpdateRecord(Record* record) {
   if (record->type() == PERF_RECORD_MMAP) {
     UpdateMmapRecordForEmbeddedPath(*static_cast<MmapRecord*>(record), false, 0);
   } else if (record->type() == PERF_RECORD_MMAP2) {
     auto r = static_cast<Mmap2Record*>(record);
     UpdateMmapRecordForEmbeddedPath(*r, true, r->data->prot);
+  } else if (record->type() == PERF_RECORD_COMM) {
+    auto r = static_cast<CommRecord*>(record);
+    if (r->data->pid == r->data->tid) {
+      std::string s = GetCompleteProcessName(r->data->pid);
+      if (!s.empty()) {
+        r->SetCommandName(s);
+      }
+    }
   }
 }
 

@@ -35,6 +35,10 @@ Test using both `adb root` and `adb unroot`.
 
 """
 from __future__ import print_function
+import argparse
+import filecmp
+import fnmatch
+import inspect
 import os
 import re
 import shutil
@@ -46,9 +50,11 @@ import types
 import unittest
 
 from app_profiler import NativeLibDownloader
+from binary_cache_builder import BinaryCacheBuilder
 from simpleperf_report_lib import ReportLib
-from utils import log_info, log_fatal
-from utils import AdbHelper, Addr2Nearestline, get_script_dir, is_windows, Objdump, ReadElf, remove
+from utils import log_exit, log_info, log_fatal
+from utils import AdbHelper, Addr2Nearestline, bytes_to_str, find_tool_path, get_script_dir
+from utils import is_python3, is_windows, Objdump, ReadElf, remove, SourceFileSearcher
 
 try:
     # pylint: disable=unused-import
@@ -68,7 +74,11 @@ def get_device_features():
     return adb.check_run_and_return_output(['shell', '/data/local/tmp/simpleperf', 'list',
                                             '--show-features'])
 
-SUPPORT_TRACE_OFFCPU = 'trace-offcpu' in get_device_features()
+def is_trace_offcpu_supported():
+    if not hasattr(is_trace_offcpu_supported, 'value'):
+        is_trace_offcpu_supported.value = 'trace-offcpu' in get_device_features()
+    return is_trace_offcpu_supported.value
+
 
 def build_testdata():
     """ Collect testdata from ../testdata and ../demo. """
@@ -104,6 +114,7 @@ class TestBase(unittest.TestCase):
             else:
                 subproc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=use_shell)
                 (output_data, _) = subproc.communicate()
+                output_data = bytes_to_str(output_data)
                 returncode = subproc.returncode
         except OSError:
             returncode = None
@@ -145,7 +156,7 @@ class TestExampleBase(TestBase):
         cls.use_compiled_java_code = android_version <= 8
 
     def setUp(self):
-        if self.id().find('TraceOffCpu') != -1 and not SUPPORT_TRACE_OFFCPU:
+        if self.id().find('TraceOffCpu') != -1 and not is_trace_offcpu_supported():
             self.skipTest('trace-offcpu is not supported on device')
         cls = self.__class__
         if not cls.has_perf_data_for_report:
@@ -577,6 +588,8 @@ class TestExampleWithNative(TestExampleBase):
 
     def test_report_html(self):
         self.common_test_report_html()
+        self.run_cmd(['report_html.py', '--add_source_code', '--source_dirs', 'testdata',
+                      '--add_disassembly', '--binary_filter', "libnative-lib.so"])
 
 
 class TestExampleWithNativeRoot(TestExampleBase):
@@ -797,21 +810,37 @@ class TestExampleOfKotlinTraceOffCpu(TestExampleBase):
             (function_prefix + 'SleepFunction', 20)])
 
 
-class TestProfilingCmd(TestBase):
-    def test_smoke(self):
-        remove("perf.data")
+class TestNativeProfiling(TestBase):
+    def setUp(self):
+        self.adb = AdbHelper()
+        self.is_rooted_device = self.adb.switch_to_root()
+
+    def test_profile_cmd(self):
         self.run_cmd(["app_profiler.py", "-cmd", "pm -l", "--disable_adb_root"])
         self.run_cmd(["report.py", "-g", "-o", "report.txt"])
 
+    def test_profile_native_program(self):
+        if not self.is_rooted_device:
+            return
+        self.run_cmd(["app_profiler.py", "-np", "surfaceflinger"])
+        self.run_cmd(["report.py", "-g", "-o", "report.txt"])
+        self.run_cmd([INFERNO_SCRIPT, "-sc"])
+        self.run_cmd([INFERNO_SCRIPT, "-np", "surfaceflinger"])
 
-class TestProfilingNativeProgram(TestBase):
-    def test_smoke(self):
-        adb = AdbHelper()
-        if adb.switch_to_root():
-            self.run_cmd(["app_profiler.py", "-np", "surfaceflinger"])
-            self.run_cmd(["report.py", "-g", "-o", "report.txt"])
-            self.run_cmd([INFERNO_SCRIPT, "-sc"])
-            self.run_cmd([INFERNO_SCRIPT, "-np", "surfaceflinger"])
+    def test_profile_pids(self):
+        if not self.is_rooted_device:
+            return
+        pid = int(self.adb.check_run_and_return_output(['shell', 'pidof', 'system_server']))
+        self.run_cmd(['app_profiler.py', '--pid', str(pid), '-r', '--duration 1'])
+        self.run_cmd(['app_profiler.py', '--pid', str(pid), str(pid), '-r', '--duration 1'])
+        self.run_cmd(['app_profiler.py', '--tid', str(pid), '-r', '--duration 1'])
+        self.run_cmd(['app_profiler.py', '--tid', str(pid), str(pid), '-r', '--duration 1'])
+        self.run_cmd([INFERNO_SCRIPT, '--pid', str(pid), '-t', '1'])
+
+    def test_profile_system_wide(self):
+        if not self.is_rooted_device:
+            return
+        self.run_cmd(['app_profiler.py', '--system_wide', '-r', '--duration 1'])
 
 
 class TestReportLib(unittest.TestCase):
@@ -942,6 +971,10 @@ class TestRunSimpleperfOnDevice(TestBase):
 
 class TestTools(unittest.TestCase):
     def test_addr2nearestline(self):
+        self.run_addr2nearestline_test(True)
+        self.run_addr2nearestline_test(False)
+
+    def run_addr2nearestline_test(self, with_function_name):
         binary_cache_path = 'testdata'
         test_map = {
             '/simpleperf_runtest_two_functions_arm64': [
@@ -949,12 +982,15 @@ class TestTools(unittest.TestCase):
                     'func_addr': 0x668,
                     'addr': 0x668,
                     'source': 'system/extras/simpleperf/runtest/two_functions.cpp:20',
+                    'function': 'main',
                 },
                 {
                     'func_addr': 0x668,
                     'addr': 0x6a4,
                     'source': """system/extras/simpleperf/runtest/two_functions.cpp:7
                                  system/extras/simpleperf/runtest/two_functions.cpp:22""",
+                    'function': """Function1()
+                                   main""",
                 },
             ],
             '/simpleperf_runtest_two_functions_arm': [
@@ -963,12 +999,16 @@ class TestTools(unittest.TestCase):
                     'addr': 0x7b0,
                     'source': """system/extras/simpleperf/runtest/two_functions.cpp:14
                                  system/extras/simpleperf/runtest/two_functions.cpp:23""",
+                    'function': """Function2()
+                                   main""",
                 },
                 {
                     'func_addr': 0x784,
                     'addr': 0x7d0,
                     'source': """system/extras/simpleperf/runtest/two_functions.cpp:15
                                  system/extras/simpleperf/runtest/two_functions.cpp:23""",
+                    'function': """Function2()
+                                   main""",
                 }
             ],
             '/simpleperf_runtest_two_functions_x86_64': [
@@ -976,12 +1016,15 @@ class TestTools(unittest.TestCase):
                     'func_addr': 0x840,
                     'addr': 0x840,
                     'source': 'system/extras/simpleperf/runtest/two_functions.cpp:7',
+                    'function': 'Function1()',
                 },
                 {
                     'func_addr': 0x920,
                     'addr': 0x94a,
                     'source': """system/extras/simpleperf/runtest/two_functions.cpp:7
                                  system/extras/simpleperf/runtest/two_functions.cpp:22""",
+                    'function': """Function1()
+                                   main""",
                 }
             ],
             '/simpleperf_runtest_two_functions_x86': [
@@ -989,16 +1032,19 @@ class TestTools(unittest.TestCase):
                     'func_addr': 0x6d0,
                     'addr': 0x6da,
                     'source': 'system/extras/simpleperf/runtest/two_functions.cpp:14',
+                    'function': 'Function2()',
                 },
                 {
                     'func_addr': 0x710,
                     'addr': 0x749,
                     'source': """system/extras/simpleperf/runtest/two_functions.cpp:8
                                  system/extras/simpleperf/runtest/two_functions.cpp:22""",
+                    'function': """Function1()
+                                   main""",
                 }
             ],
         }
-        addr2line = Addr2Nearestline(None, binary_cache_path)
+        addr2line = Addr2Nearestline(None, binary_cache_path, with_function_name)
         for dso_path in test_map:
             test_addrs = test_map[dso_path]
             for test_addr in test_addrs:
@@ -1009,17 +1055,26 @@ class TestTools(unittest.TestCase):
             self.assertTrue(dso is not None)
             test_addrs = test_map[dso_path]
             for test_addr in test_addrs:
-                source_str = test_addr['source']
-                expected_source = []
-                for line in source_str.split('\n'):
+                expected_files = []
+                expected_lines = []
+                expected_functions = []
+                for line in test_addr['source'].split('\n'):
                     items = line.split(':')
-                    expected_source.append((items[0].strip(), int(items[1])))
+                    expected_files.append(items[0].strip())
+                    expected_lines.append(int(items[1]))
+                for line in test_addr['function'].split('\n'):
+                    expected_functions.append(line.strip())
+                self.assertEquals(len(expected_files), len(expected_functions))
+
                 actual_source = addr2line.get_addr_source(dso, test_addr['addr'])
                 self.assertTrue(actual_source is not None)
-                self.assertEqual(len(actual_source), len(expected_source))
-                for i, (actual_file_path, actual_line) in enumerate(expected_source):
-                    self.assertEqual(actual_file_path, expected_source[i][0])
-                    self.assertEqual(actual_line, expected_source[i][1])
+                self.assertEqual(len(actual_source), len(expected_files))
+                for i, source in enumerate(actual_source):
+                    self.assertEqual(len(source), 3 if with_function_name else 2)
+                    self.assertEqual(source[0], expected_files[i])
+                    self.assertEqual(source[1], expected_lines[i])
+                    if with_function_name:
+                        self.assertEqual(source[2], expected_functions[i])
 
     def test_objdump(self):
         binary_cache_path = 'testdata'
@@ -1063,11 +1118,12 @@ class TestTools(unittest.TestCase):
         }
         objdump = Objdump(None, binary_cache_path)
         for dso_path in test_map:
-            dso_info = test_map[dso_path]
-            disassemble_code = objdump.disassemble_code(dso_path, dso_info['start_addr'],
-                                                        dso_info['len'])
+            dso = test_map[dso_path]
+            dso_info = objdump.get_dso_info(dso_path)
+            self.assertIsNotNone(dso_info)
+            disassemble_code = objdump.disassemble_code(dso_info, dso['start_addr'], dso['len'])
             self.assertTrue(disassemble_code)
-            for item in dso_info['expected_items']:
+            for item in dso['expected_items']:
                 self.assertTrue(item in disassemble_code)
 
     def test_readelf(self):
@@ -1108,6 +1164,29 @@ class TestTools(unittest.TestCase):
         self.assertEqual(readelf.get_build_id('not_exist_file'), '')
         self.assertEqual(readelf.get_sections('not_exist_file'), [])
 
+    def test_source_file_searcher(self):
+        searcher = SourceFileSearcher(['testdata'])
+        def format_path(path):
+            return path.replace('/', os.sep)
+        # Find a C++ file with pure file name.
+        self.assertEquals(
+            format_path('testdata/SimpleperfExampleWithNative/app/src/main/cpp/native-lib.cpp'),
+            searcher.get_real_path('native-lib.cpp'))
+        # Find a C++ file with an absolute file path.
+        self.assertEquals(
+            format_path('testdata/SimpleperfExampleWithNative/app/src/main/cpp/native-lib.cpp'),
+            searcher.get_real_path('/data/native-lib.cpp'))
+        # Find a Java file.
+        self.assertEquals(
+            format_path('testdata/SimpleperfExampleWithNative/app/src/main/java/com/example/' +
+                        'simpleperf/simpleperfexamplewithnative/MainActivity.java'),
+            searcher.get_real_path('simpleperfexamplewithnative/MainActivity.java'))
+        # Find a Kotlin file.
+        self.assertEquals(
+            format_path('testdata/SimpleperfExampleOfKotlin/app/src/main/java/com/example/' +
+                        'simpleperf/simpleperfexampleofkotlin/MainActivity.kt'),
+            searcher.get_real_path('MainActivity.kt'))
+
 
 class TestNativeLibDownloader(unittest.TestCase):
     def test_smoke(self):
@@ -1128,7 +1207,7 @@ class TestNativeLibDownloader(unittest.TestCase):
         downloader.collect_native_libs_on_device()
         self.assertEqual(len(downloader.device_build_id_map), 0)
 
-        lib_list = downloader.host_build_id_map.items()
+        lib_list = list(downloader.host_build_id_map.items())
         for sync_count in [0, 1, 2]:
             build_id_map = {}
             for i in range(sync_count):
@@ -1150,33 +1229,117 @@ class TestNativeLibDownloader(unittest.TestCase):
             if sync_count == 1:
                 adb.run(['pull', '/data/local/tmp/native_libs/build_id_list', 'build_id_list'])
                 with open('build_id_list', 'rb') as fh:
-                    self.assertEqual(fh.read(), '{}={}\n'.format(lib_list[0][0],
-                                                                 lib_list[0][1].name))
+                    self.assertEqual(bytes_to_str(fh.read()),
+                                     '{}={}\n'.format(lib_list[0][0], lib_list[0][1].name))
                 remove('build_id_list')
         adb.run(['shell', 'rm', '-rf', '/data/local/tmp/native_libs'])
 
 
-def list_tests():
+class TestReportHtml(TestBase):
+    def test_long_callchain(self):
+        self.run_cmd(['report_html.py', '-i', 'testdata/perf_with_long_callchain.data'])
+
+
+class TestBinaryCacheBuilder(TestBase):
+    def test_copy_binaries_from_symfs_dirs(self):
+        readelf = ReadElf(None)
+        strip = find_tool_path('strip', arch='arm')
+        self.assertIsNotNone(strip)
+        symfs_dir = os.path.join('testdata', 'symfs_dir')
+        remove(symfs_dir)
+        os.mkdir(symfs_dir)
+        filename = 'simpleperf_runtest_two_functions_arm'
+        origin_file = os.path.join('testdata', filename)
+        source_file = os.path.join(symfs_dir, filename)
+        target_file = os.path.join('binary_cache', filename)
+        expected_build_id = readelf.get_build_id(origin_file)
+        binary_cache_builder = BinaryCacheBuilder(None, False)
+        binary_cache_builder.binaries['simpleperf_runtest_two_functions_arm'] = expected_build_id
+
+        # Copy binary if target file doesn't exist.
+        remove(target_file)
+        self.run_cmd([strip, '--strip-all', '-o', source_file, origin_file])
+        binary_cache_builder.copy_binaries_from_symfs_dirs([symfs_dir])
+        self.assertTrue(filecmp.cmp(target_file, source_file))
+
+        # Copy binary if target file doesn't have .symtab and source file has .symtab.
+        self.run_cmd([strip, '--strip-debug', '-o', source_file, origin_file])
+        binary_cache_builder.copy_binaries_from_symfs_dirs([symfs_dir])
+        self.assertTrue(filecmp.cmp(target_file, source_file))
+
+        # Copy binary if target file doesn't have .debug_line and source_files has .debug_line.
+        shutil.copy(origin_file, source_file)
+        binary_cache_builder.copy_binaries_from_symfs_dirs([symfs_dir])
+        self.assertTrue(filecmp.cmp(target_file, source_file))
+
+
+def get_all_tests():
     tests = []
     for name, value in globals().items():
         if isinstance(value, type) and issubclass(value, unittest.TestCase):
-            test_methods = [x for x, y in value.__dict__.items()
-                            if isinstance(y, types.FunctionType) and x.startswith('test')]
-            for method in test_methods:
-                tests.append(name + '.' + method)
-    print(' '.join(sorted(tests)))
+            for member_name, member in inspect.getmembers(value):
+                if isinstance(member, (types.MethodType, types.FunctionType)):
+                    if member_name.startswith('test'):
+                        tests.append(name + '.' + member_name)
+    return sorted(tests)
+
+
+def run_tests(tests):
+    os.chdir(get_script_dir())
+    build_testdata()
+    log_info('Run tests with python%d\n%s' % (3 if is_python3() else 2, '\n'.join(tests)))
+    argv = [sys.argv[0]] + tests
+    unittest.main(argv=argv, failfast=True, verbosity=2, exit=False)
 
 
 def main():
-    if len(sys.argv) == 2 and sys.argv[1] == '--list-tests':
-        list_tests()
+    parser = argparse.ArgumentParser(description='Test simpleperf scripts')
+    parser.add_argument('--list-tests', action='store_true', help='List all tests.')
+    parser.add_argument('--test-from', nargs=1, help='Run left tests from the selected test.')
+    parser.add_argument('--python-version', choices=['2', '3', 'both'], default='both', help="""
+                        Run tests on which python versions.""")
+    parser.add_argument('pattern', nargs='*', help='Run tests matching the selected pattern.')
+    args = parser.parse_args()
+    tests = get_all_tests()
+    if args.list_tests:
+        print('\n'.join(tests))
         return
-    os.chdir(get_script_dir())
-    build_testdata()
+    if args.test_from:
+        start_pos = 0
+        while start_pos < len(tests) and tests[start_pos] != args.test_from[0]:
+            start_pos += 1
+        if start_pos == len(tests):
+            log_exit("Can't find test %s" % args.test_from[0])
+        tests = tests[start_pos:]
+    if args.pattern:
+        pattern = re.compile(fnmatch.translate(args.pattern[0]))
+        new_tests = []
+        for test in tests:
+            if pattern.match(test):
+                new_tests.append(test)
+        tests = new_tests
+        if not tests:
+            log_exit('No tests are matched.')
+
     if AdbHelper().get_android_version() < 7:
         log_info("Skip tests on Android version < N.")
         sys.exit(0)
-    unittest.main(failfast=True, verbosity=2)
+
+    if args.python_version == 'both':
+        python_versions = [2, 3]
+    else:
+        python_versions = [int(args.python_version)]
+    current_version = 3 if is_python3() else 2
+    for version in python_versions:
+        if version != current_version:
+            argv = ['python3' if version == 3 else 'python']
+            argv.append(os.path.join(get_script_dir(), 'test.py'))
+            argv += sys.argv[1:]
+            argv += ['--python-version', str(version)]
+            subprocess.check_call(argv)
+        else:
+            run_tests(tests)
+
 
 if __name__ == '__main__':
     main()

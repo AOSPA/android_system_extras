@@ -108,7 +108,15 @@ status_t PerfProfdNativeService::start() {
 
 status_t PerfProfdNativeService::dump(int fd, const Vector<String16> &args) {
   auto out = std::fstream(base::StringPrintf("/proc/self/fd/%d", fd));
-  out << "Nothing to log, yet!" << std::endl;
+  auto print_config = [&out](bool is_profiling, const Config* config) {
+    if (is_profiling) {
+      out << "Profiling with config: " << ConfigReader::ConfigToString(*config);
+    } else {
+      out << "Not actively profiling.";
+    }
+  };
+  RunOnConfig(print_config);
+  out << std::endl;
 
   return NO_ERROR;
 }
@@ -343,6 +351,15 @@ status_t PerfProfdNativeService::onTransact(uint32_t _aidl_code,
 }  // namespace
 
 int Main() {
+  {
+    struct DummyConfig : public Config {
+      void Sleep(size_t seconds) override {}
+      bool IsProfilingEnabled() const override { return false; }
+    };
+    DummyConfig config;
+    GlobalInit(config.perf_path);
+  }
+
   android::status_t ret;
   if ((ret = PerfProfdNativeService::start()) != android::OK) {
     LOG(ERROR) << "Unable to start InstalldNativeService: %d" << ret;

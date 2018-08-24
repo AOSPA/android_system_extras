@@ -80,12 +80,17 @@ message ProfilingConfig {
 
   // Whether to use a symbolizer on-device.
   optional bool use_elf_symbolizer = 19;
+  // Whether to symbolize everything. If false, objects with build ID will be skipped.
+  optional bool symbolize_everything = 25;
 
   // Whether to send the result to dropbox.
   optional bool send_to_dropbox = 20;
 
   // If true, use libz to compress the output proto.
   optional bool compress = 21;
+
+  // Whether to fail or strip unsupported events.
+  optional bool fail_on_unsupported_events = 24;
 
   repeated PerfConfigElement event_config = 23;
 };
