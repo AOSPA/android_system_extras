@@ -304,7 +304,7 @@ bool get_charging()
 
   sp<IHealth> service = get_health_service();
   if (service == nullptr) {
-    PLOG(ERROR) << "Failed to get health HAL";
+    LOG(ERROR) << "Failed to get health HAL";
     return false;
   }
   Result res = Result::UNKNOWN;
@@ -314,14 +314,15 @@ bool get_charging()
     val = out_val;
   });
   if (!ret.isOk()) {
-    PLOG(ERROR) << "Failed to call getChargeStatus on health HAL: " << ret.description();
+    LOG(ERROR) << "Failed to call getChargeStatus on health HAL: " << ret.description();
     return false;
   }
-  if (res != Result::SUCCESS) {
-    PLOG(ERROR) << "Failed to retrieve charge status from health HAL: " << toString(res);
+  if (res != Result::SUCCESS || val == BatteryStatus::UNKNOWN) {
+    LOG(ERROR) << "Failed to retrieve charge status from health HAL: result = " << toString(res)
+                << ", status = " << toString(val);
     return false;
   }
-  return val == BatteryStatus::CHARGING;
+  return val == BatteryStatus::CHARGING || val == BatteryStatus::FULL;
 #else
   return false;
 #endif
@@ -426,7 +427,9 @@ static ProtoUniquePtr encode_to_proto(const std::string &data_file_path,
   // Open and read perf.data file
   //
   ProtoUniquePtr encodedProfile(
-      android::perfprofd::RawPerfDataToAndroidPerfProfile(data_file_path, symbolizer));
+      android::perfprofd::RawPerfDataToAndroidPerfProfile(data_file_path,
+                                                          symbolizer,
+                                                          config.symbolize_everything));
   if (encodedProfile == nullptr) {
     return nullptr;
   }
@@ -637,6 +640,12 @@ void CommonInit(uint32_t use_fixed_seed, const char* dest_dir) {
 #endif
 
   common_initialized = true;
+}
+
+void GlobalInit(const std::string& perf_path) {
+  if (!android::perfprofd::FindSupportedPerfCounters(perf_path)) {
+    LOG(WARNING) << "Could not read supported perf counters.";
+  }
 }
 
 bool IsDebugBuild() {

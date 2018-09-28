@@ -14,20 +14,96 @@
  * limitations under the License.
  */
 
-#include "hash_tree_builder.h"
+#include "verity/hash_tree_builder.h"
+
+#include <algorithm>
+#include <memory>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
+#include <openssl/bn.h>
 
 #include "build_verity_tree_utils.h"
 
-HashTreeBuilder::HashTreeBuilder(size_t block_size)
-    : block_size_(block_size), data_size_(0), md_(EVP_sha256()) {
+const EVP_MD* HashTreeBuilder::HashFunction(const std::string& hash_name) {
+  if (android::base::EqualsIgnoreCase(hash_name, "sha1")) {
+    return EVP_sha1();
+  }
+  if (android::base::EqualsIgnoreCase(hash_name, "sha256")) {
+    return EVP_sha256();
+  }
+  if (android::base::EqualsIgnoreCase(hash_name, "sha384")) {
+    return EVP_sha384();
+  }
+  if (android::base::EqualsIgnoreCase(hash_name, "sha512")) {
+    return EVP_sha512();
+  }
+
+  LOG(ERROR) << "Unsupported hash algorithm " << hash_name;
+  return nullptr;
+}
+
+HashTreeBuilder::HashTreeBuilder(size_t block_size, const EVP_MD* md)
+    : block_size_(block_size), data_size_(0), md_(md) {
   CHECK(md_ != nullptr) << "Failed to initialize md";
 
-  hash_size_ = EVP_MD_size(md_);
+  hash_size_raw_ = EVP_MD_size(md_);
+
+  // Round up the hash size to the next power of 2.
+  hash_size_ = 1;
+  while (hash_size_ < hash_size_raw_) {
+    hash_size_ = hash_size_ << 1;
+  }
   CHECK_LT(hash_size_ * 2, block_size_);
+}
+
+std::string HashTreeBuilder::BytesArrayToString(
+    const std::vector<unsigned char>& bytes) {
+  std::string result;
+  for (const auto& c : bytes) {
+    result += android::base::StringPrintf("%02x", c);
+  }
+  return result;
+}
+
+bool HashTreeBuilder::ParseBytesArrayFromString(
+    const std::string& hex_string, std::vector<unsigned char>* bytes) {
+  if (hex_string.size() % 2 != 0) {
+    LOG(ERROR) << "Hex string size must be even number " << hex_string;
+    return false;
+  }
+
+  BIGNUM* bn = nullptr;
+  if (!BN_hex2bn(&bn, hex_string.c_str())) {
+    LOG(ERROR) << "Failed to parse hex in " << hex_string;
+    return false;
+  }
+  std::unique_ptr<BIGNUM, decltype(&BN_free)> guard(bn, BN_free);
+
+  size_t bytes_size = BN_num_bytes(bn);
+  bytes->resize(bytes_size);
+  if (BN_bn2bin(bn, bytes->data()) != bytes_size) {
+    LOG(ERROR) << "Failed to convert hex to bytes " << hex_string;
+    return false;
+  }
+  return true;
+}
+
+uint64_t HashTreeBuilder::CalculateSize(uint64_t input_size) const {
+  uint64_t verity_blocks = 0;
+  size_t level_blocks;
+  size_t levels = 0;
+  do {
+    level_blocks =
+        verity_tree_blocks(input_size, block_size_, hash_size_, levels);
+    levels++;
+    verity_blocks += level_blocks;
+  } while (level_blocks > 1);
+
+  return verity_blocks * block_size_;
 }
 
 bool HashTreeBuilder::Initialize(int64_t expected_data_size,
@@ -70,7 +146,9 @@ bool HashTreeBuilder::HashBlock(const unsigned char* block,
   EVP_MD_CTX_destroy(mdctx);
 
   CHECK_EQ(1, ret);
-  CHECK_EQ(hash_size_, s);
+  CHECK_EQ(hash_size_raw_, s);
+  std::fill(out + s, out + hash_size_, 0);
+
   return true;
 }
 
@@ -149,11 +227,16 @@ bool HashTreeBuilder::WriteHashTreeToFile(const std::string& output) const {
     return false;
   }
 
-  return WriteHashTreeToFd(output_fd);
+  return WriteHashTreeToFd(output_fd, 0);
 }
 
-bool HashTreeBuilder::WriteHashTreeToFd(int fd) const {
+bool HashTreeBuilder::WriteHashTreeToFd(int fd, uint64_t offset) const {
   CHECK(!verity_tree_.empty());
+
+  if (lseek(fd, offset, SEEK_SET) != offset) {
+    PLOG(ERROR) << "Failed to seek the output fd, offset: " << offset;
+    return false;
+  }
 
   // Reads reversely to output the verity tree top-down.
   for (size_t i = verity_tree_.size(); i > 0; i--) {
