@@ -101,9 +101,9 @@ int main(int argc, char* argv[]) {
 
     for (const auto& partition : pt->partitions) {
         std::string name = GetPartitionName(partition);
-        std::string guid = GetPartitionGuid(partition);
+        std::string group_name = GetPartitionGroupName(pt->groups[partition.group_index]);
         printf("  Name: %s\n", name.c_str());
-        printf("  GUID: %s\n", guid.c_str());
+        printf("  Group: %s\n", group_name.c_str());
         printf("  Attributes: %s\n", BuildAttributeString(partition.attributes).c_str());
         printf("  Extents:\n");
         uint64_t first_sector = 0;
@@ -121,6 +121,15 @@ int main(int argc, char* argv[]) {
         }
         printf("------------------------\n");
     }
+
+    printf("Group table:\n");
+    printf("------------------------\n");
+    for (const auto& group : pt->groups) {
+        std::string group_name = GetPartitionGroupName(group);
+        printf("  Name: %s\n", group_name.c_str());
+        printf("  Maximum size: %" PRIx64 "\n", group.maximum_size);
+    }
+    printf("------------------------\n");
 
     return EX_OK;
 }
