@@ -52,8 +52,6 @@ struct ext4_encryption_policy {
 
 #define EXT4_ENCRYPTION_MODE_AES_256_XTS    1
 #define EXT4_ENCRYPTION_MODE_AES_256_CTS    4
-#define EXT4_ENCRYPTION_MODE_SPECK128_256_XTS 7
-#define EXT4_ENCRYPTION_MODE_SPECK128_256_CTS 8
 #define EXT4_ENCRYPTION_MODE_AES_256_HEH    126
 #define EXT4_ENCRYPTION_MODE_PRIVATE        127
 
@@ -260,10 +258,18 @@ int e4crypt_policy_ensure(const char *directory, const char *policy,
     if (!strcmp(contents_encryption_mode, "software") ||
         !strcmp(contents_encryption_mode, "aes-256-xts")) {
         contents_mode = EXT4_ENCRYPTION_MODE_AES_256_XTS;
+<<<<<<< HEAD
     } else if (!strcmp(contents_encryption_mode, "speck128/256-xts")) {
         contents_mode = EXT4_ENCRYPTION_MODE_SPECK128_256_XTS;
     } else if ((!strcmp(contents_encryption_mode, "ice")) ||
                    (!strcmp(contents_encryption_mode, "ice_wrapped_key_supported"))) {
+||||||| merged common ancestors
+    } else if (!strcmp(contents_encryption_mode, "speck128/256-xts")) {
+        contents_mode = EXT4_ENCRYPTION_MODE_SPECK128_256_XTS;
+    } else if (!strcmp(contents_encryption_mode, "ice")) {
+=======
+    } else if (!strcmp(contents_encryption_mode, "ice")) {
+>>>>>>> origin/mirror-aosp-pie-platform-release
         contents_mode = EXT4_ENCRYPTION_MODE_PRIVATE;
     } else {
         LOG(ERROR) << "Invalid file contents encryption mode: "
@@ -273,8 +279,6 @@ int e4crypt_policy_ensure(const char *directory, const char *policy,
 
     if (!strcmp(filenames_encryption_mode, "aes-256-cts")) {
         filenames_mode = EXT4_ENCRYPTION_MODE_AES_256_CTS;
-    } else if (!strcmp(filenames_encryption_mode, "speck128/256-cts")) {
-        filenames_mode = EXT4_ENCRYPTION_MODE_SPECK128_256_CTS;
     } else if (!strcmp(filenames_encryption_mode, "aes-256-heh")) {
         filenames_mode = EXT4_ENCRYPTION_MODE_AES_256_HEH;
     } else {
