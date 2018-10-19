@@ -1,6 +1,0 @@
-# List of unresolved conflicts
-# Generated with `git ls-files --unmerged`
-
-100644 5ec8723b093c41cc0e30e96cd74b2bb304374b28 1	ext4_utils/ext4_crypt.cpp
-100644 f4727c8ff82b9c86dc6420ce14f79021e244fc06 2	ext4_utils/ext4_crypt.cpp
-100644 36fe11f7427362966bc4148e238a8043b029dd32 3	ext4_utils/ext4_crypt.cpp

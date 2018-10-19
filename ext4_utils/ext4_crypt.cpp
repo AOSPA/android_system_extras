@@ -258,18 +258,8 @@ int e4crypt_policy_ensure(const char *directory, const char *policy,
     if (!strcmp(contents_encryption_mode, "software") ||
         !strcmp(contents_encryption_mode, "aes-256-xts")) {
         contents_mode = EXT4_ENCRYPTION_MODE_AES_256_XTS;
-<<<<<<< HEAD
-    } else if (!strcmp(contents_encryption_mode, "speck128/256-xts")) {
-        contents_mode = EXT4_ENCRYPTION_MODE_SPECK128_256_XTS;
     } else if ((!strcmp(contents_encryption_mode, "ice")) ||
                    (!strcmp(contents_encryption_mode, "ice_wrapped_key_supported"))) {
-||||||| merged common ancestors
-    } else if (!strcmp(contents_encryption_mode, "speck128/256-xts")) {
-        contents_mode = EXT4_ENCRYPTION_MODE_SPECK128_256_XTS;
-    } else if (!strcmp(contents_encryption_mode, "ice")) {
-=======
-    } else if (!strcmp(contents_encryption_mode, "ice")) {
->>>>>>> origin/mirror-aosp-pie-platform-release
         contents_mode = EXT4_ENCRYPTION_MODE_PRIVATE;
     } else {
         LOG(ERROR) << "Invalid file contents encryption mode: "
