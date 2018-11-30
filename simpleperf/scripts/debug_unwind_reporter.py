@@ -251,7 +251,7 @@ class UnwindingResultErrorReport(object):
 
     def should_omit(self, sample_result, joined_record):
         # 1. Can't unwind code generated in memory.
-        for name in ['/dev/ashmem/dalvik-jit-code-cache', '//anon']:
+        for name in ['/dev/ashmem/dalvik-jit-code-cache', '[anon:dalvik-jit-code-cache]', '//anon']:
             if name in sample_result.callchain[-1].filename:
                 return True
         # 2. Don't report complete callchains, which can reach __libc_init or __start_thread in
