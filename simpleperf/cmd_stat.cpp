@@ -24,6 +24,7 @@
 #include <chrono>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <android-base/file.h>
@@ -93,6 +94,16 @@ struct CounterSummary {
     return type_name + ":" + modifier;
   }
 
+  bool IsMonitoredAllTheTime() const {
+    // If an event runs all the time it is enabled (by not sharing hardware
+    // counters with other events), the scale of its summary is usually within
+    // [1, 1 + 1e-5]. By setting SCALE_ERROR_LIMIT to 1e-5, We can identify
+    // events monitored all the time in most cases while keeping the report
+    // error rate <= 1e-5.
+    constexpr double SCALE_ERROR_LIMIT = 1e-5;
+    return (fabs(scale - 1.0) < SCALE_ERROR_LIMIT);
+  }
+
  private:
   std::string ReadableCountValue(bool csv) {
     if (type_name == "cpu-clock" || type_name == "task-clock") {
@@ -116,24 +127,49 @@ struct CounterSummary {
       }
     }
   }
+};
 
-  bool IsMonitoredAllTheTime() const {
-    // If an event runs all the time it is enabled (by not sharing hardware
-    // counters with other events), the scale of its summary is usually within
-    // [1, 1 + 1e-5]. By setting SCALE_ERROR_LIMIT to 1e-5, We can identify
-    // events monitored all the time in most cases while keeping the report
-    // error rate <= 1e-5.
-    constexpr double SCALE_ERROR_LIMIT = 1e-5;
-    return (fabs(scale - 1.0) < SCALE_ERROR_LIMIT);
-  }
+static const std::unordered_map<std::string_view, std::pair<std::string_view, std::string_view>>
+    COMMON_EVENT_RATE_MAP = {
+        {"cache-misses", {"cache-references", "miss rate"}},
+        {"branch-misses", {"branch-instructions", "miss rate"}},
+};
+
+static const std::unordered_map<std::string_view, std::pair<std::string_view, std::string_view>>
+    ARM_EVENT_RATE_MAP = {
+        // Refer to "D6.10.5 Meaningful ratios between common microarchitectural events" in ARMv8
+        // specification.
+        {"raw-l1i-cache-refill", {"raw-l1i-cache", "level 1 instruction cache refill rate"}},
+        {"raw-l1i-tlb-refill", {"raw-l1i-tlb", "level 1 instruction TLB refill rate"}},
+        {"raw-l1d-cache-refill", {"raw-l1d-cache", "level 1 data or unified cache refill rate"}},
+        {"raw-l1d-tlb-refill", {"raw-l1d-tlb", "level 1 data or unified TLB refill rate"}},
+        {"raw-l2d-cache-refill", {"raw-l2d-cache", "level 2 data or unified cache refill rate"}},
+        {"raw-l2i-cache-refill", {"raw-l2i-cache", "level 2 instruction cache refill rate"}},
+        {"raw-l3d-cache-refill", {"raw-l3d-cache", "level 3 data or unified cache refill rate"}},
+        {"raw-l2d-tlb-refill", {"raw-l2d-tlb", "level 2 data or unified TLB refill rate"}},
+        {"raw-l2i-tlb-refill", {"raw-l2i-tlb", "level 2 instruction TLB refill rate"}},
+        {"raw-bus-access", {"raw-bus-cycles", "bus accesses per cycle"}},
+        {"raw-ll-cache-miss", {"raw-ll-cache", "last level data or unified cache refill rate"}},
+        {"raw-dtlb-walk", {"raw-l1d-tlb", "data TLB miss rate"}},
+        {"raw-itlb-walk", {"raw-l1i-tlb", "instruction TLB miss rate"}},
+        {"raw-ll-cache-miss-rd", {"raw-ll-cache-rd", "memory read operation miss rate"}},
+        {"raw-remote-access-rd",
+         {"raw-remote-access", "read accesses to another socket in a multi-socket system"}},
+        // Refer to "Table K3-2 Relationship between REFILL events and associated access events" in
+        // ARMv8 specification.
+        {"raw-l1d-cache-refill-rd", {"raw-l1d-cache-rd", "level 1 cache refill rate, read"}},
+        {"raw-l1d-cache-refill-wr", {"raw-l1d-cache-wr", "level 1 cache refill rate, write"}},
+        {"raw-l1d-tlb-refill-rd", {"raw-l1d-tlb-rd", "level 1 TLB refill rate, read"}},
+        {"raw-l1d-tlb-refill-wr", {"raw-l1d-tlb-wr", "level 1 TLB refill rate, write"}},
+        {"raw-l2d-cache-refill-rd", {"raw-l2d-cache-rd", "level 2 data cache refill rate, read"}},
+        {"raw-l2d-cache-refill-wr", {"raw-l2d-cache-wr", "level 2 data cache refill rate, write"}},
+        {"raw-l2d-tlb-refill-rd", {"raw-l2d-tlb-rd", "level 2 data TLB refill rate, read"}},
 };
 
 class CounterSummaries {
  public:
   explicit CounterSummaries(bool csv) : csv_(csv) {}
-  void AddSummary(const CounterSummary& summary) {
-    summaries_.push_back(summary);
-  }
+  std::vector<CounterSummary>& Summaries() { return summaries_; }
 
   const CounterSummary* FindSummary(const std::string& type_name,
                                     const std::string& modifier) {
@@ -157,9 +193,8 @@ class CounterSummaries {
         const CounterSummary* other = FindSummary(s.type_name, "k");
         if (other != nullptr && other->IsMonitoredAtTheSameTime(s)) {
           if (FindSummary(s.type_name, "") == nullptr) {
-            AddSummary(CounterSummary(s.type_name, "", s.group_id,
-                                      s.count + other->count, s.scale, true,
-                                      csv_));
+            Summaries().emplace_back(s.type_name, "", s.group_id, s.count + other->count, s.scale,
+                                     true, csv_);
           }
         }
       }
@@ -231,31 +266,9 @@ class CounterSummaries {
                                            sap_mid);
       }
     }
-    if (android::base::EndsWith(s.type_name, "-misses")) {
-      std::string other_name;
-      if (s.type_name == "cache-misses") {
-        other_name = "cache-references";
-      } else if (s.type_name == "branch-misses") {
-        other_name = "branch-instructions";
-      } else {
-        other_name =
-            s.type_name.substr(0, s.type_name.size() - strlen("-misses")) + "s";
-      }
-      const CounterSummary* other = FindSummary(other_name, s.modifier);
-      if (other != nullptr && other->IsMonitoredAtTheSameTime(s) &&
-          other->count != 0) {
-        double miss_rate = static_cast<double>(s.count) / other->count;
-        return android::base::StringPrintf("%lf%%%cmiss rate", miss_rate * 100,
-                                           sap_mid);
-      }
-    }
-    if (android::base::EndsWith(s.type_name, "-refill")) {
-      std::string other_name = s.type_name.substr(0, s.type_name.size() - strlen("-refill"));
-      const CounterSummary* other = FindSummary(other_name, s.modifier);
-      if (other != nullptr && other->IsMonitoredAtTheSameTime(s) && other->count != 0) {
-        double miss_rate = static_cast<double>(s.count) / other->count;
-        return android::base::StringPrintf("%f%%%cmiss rate", miss_rate * 100, sap_mid);
-      }
+    std::string rate_comment = GetRateComment(s, sap_mid);
+    if (!rate_comment.empty()) {
+      return rate_comment;
     }
     double running_time_in_sec;
     if (!FindRunningTimeForSummary(s, &running_time_in_sec)) {
@@ -274,6 +287,34 @@ class CounterSummaries {
     return android::base::StringPrintf("%.3lf%c/sec", rate, sap_mid);
   }
 
+  std::string GetRateComment(const CounterSummary& s, char sep) {
+    std::string_view miss_event_name = s.type_name;
+    std::string event_name;
+    std::string rate_desc;
+    if (auto it = COMMON_EVENT_RATE_MAP.find(miss_event_name); it != COMMON_EVENT_RATE_MAP.end()) {
+      event_name = it->second.first;
+      rate_desc = it->second.second;
+    }
+    if (event_name.empty() && (GetBuildArch() == ARCH_ARM || GetBuildArch() == ARCH_ARM64)) {
+      if (auto it = ARM_EVENT_RATE_MAP.find(miss_event_name); it != ARM_EVENT_RATE_MAP.end()) {
+        event_name = it->second.first;
+        rate_desc = it->second.second;
+      }
+    }
+    if (event_name.empty() && android::base::ConsumeSuffix(&miss_event_name, "-misses")) {
+      event_name = std::string(miss_event_name) + "s";
+      rate_desc = "miss rate";
+    }
+    if (!event_name.empty()) {
+      const CounterSummary* other = FindSummary(event_name, s.modifier);
+      if (other != nullptr && other->IsMonitoredAtTheSameTime(s) && other->count != 0) {
+        double miss_rate = static_cast<double>(s.count) / other->count;
+        return android::base::StringPrintf("%f%%%c%s", miss_rate * 100, sep, rate_desc.c_str());
+      }
+    }
+    return "";
+  }
+
   bool FindRunningTimeForSummary(const CounterSummary& summary, double* running_time_in_sec) {
     for (auto& s : summaries_) {
       if ((s.type_name == "task-clock" || s.type_name == "cpu-clock") &&
@@ -288,6 +329,48 @@ class CounterSummaries {
  private:
   std::vector<CounterSummary> summaries_;
   bool csv_;
+};
+
+// devfreq may use performance counters to calculate memory latency (as in
+// drivers/devfreq/arm-memlat-mon.c). Hopefully we can get more available counters by asking devfreq
+// to not use the memory latency governor temporarily.
+class DevfreqCounters {
+ public:
+  bool Use() {
+    if (!IsRoot()) {
+      LOG(ERROR) << "--use-devfreq-counters needs root permission to set devfreq governors";
+      return false;
+    }
+    std::string devfreq_dir = "/sys/class/devfreq/";
+    for (auto& name : GetSubDirs(devfreq_dir)) {
+      std::string governor_path = devfreq_dir + name + "/governor";
+      if (IsRegularFile(governor_path)) {
+        std::string governor;
+        if (!android::base::ReadFileToString(governor_path, &governor)) {
+          LOG(ERROR) << "failed to read " << governor_path;
+          return false;
+        }
+        governor = android::base::Trim(governor);
+        if (governor == "mem_latency") {
+          if (!android::base::WriteStringToFile("performance", governor_path)) {
+            PLOG(ERROR) << "failed to write " << governor_path;
+            return false;
+          }
+          mem_latency_governor_paths_.emplace_back(std::move(governor_path));
+        }
+      }
+    }
+    return true;
+  }
+
+  ~DevfreqCounters() {
+    for (auto& path : mem_latency_governor_paths_) {
+      android::base::WriteStringToFile("mem_latency", path);
+    }
+  }
+
+ private:
+  std::vector<std::string> mem_latency_governor_paths_;
 };
 
 class StatCommand : public Command {
@@ -334,6 +417,14 @@ class StatCommand : public Command {
 "-o output_filename  Write report to output_filename instead of standard output.\n"
 "-p pid1,pid2,... Stat events on existing processes. Mutually exclusive with -a.\n"
 "-t tid1,tid2,... Stat events on existing threads. Mutually exclusive with -a.\n"
+#if defined(__ANDROID__)
+"--use-devfreq-counters    On devices with Qualcomm SOCs, some hardware counters may be used\n"
+"                          to monitor memory latency (in drivers/devfreq/arm-memlat-mon.c),\n"
+"                          making fewer counters available to users. This option asks devfreq\n"
+"                          to temporarily release counters by replacing memory-latency governor\n"
+"                          with performance governor. It affects memory latency during profiling,\n"
+"                          and may cause wedged power if simpleperf is killed in between.\n"
+#endif
 "--verbose        Show result in verbose mode.\n"
 #if 0
 // Below options are only used internally and shouldn't be visible to the public.
@@ -382,6 +473,7 @@ class StatCommand : public Command {
   std::string app_package_name_;
   bool in_app_context_;
   android::base::unique_fd stop_signal_fd_;
+  bool use_devfreq_counters_ = false;
 };
 
 bool StatCommand::Run(const std::vector<std::string>& args) {
@@ -398,6 +490,12 @@ bool StatCommand::Run(const std::vector<std::string>& args) {
     if (!IsRoot()) {
       return RunInAppContext(app_package_name_, "stat", args, workload_args.size(),
                              output_filename_, !event_selection_set_.GetTracepointEvents().empty());
+    }
+  }
+  DevfreqCounters devfreq_counters;
+  if (use_devfreq_counters_) {
+    if (!devfreq_counters.Use()) {
+      return false;
     }
   }
   if (event_selection_set_.empty()) {
@@ -621,6 +719,10 @@ bool StatCommand::ParseOptions(const std::vector<std::string>& args,
       if (!SetTracepointEventsFilePath(args[i])) {
         return false;
       }
+#if defined(__ANDROID__)
+    } else if (args[i] == "--use-devfreq-counters") {
+      use_devfreq_counters_ = true;
+#endif
     } else if (args[i] == "--verbose") {
       verbose_mode_ = true;
     } else {
@@ -700,6 +802,7 @@ bool StatCommand::ShowCounters(const std::vector<CountersInfo>& counters,
     }
   }
 
+  bool counters_always_available = true;
   CounterSummaries summaries(csv_);
   for (size_t i = 0; i < counters.size(); ++i) {
     const CountersInfo& counters_info = counters[i];
@@ -724,9 +827,9 @@ bool StatCommand::ShowCounters(const std::vector<CountersInfo>& counters,
     if (sum.time_running < sum.time_enabled && sum.time_running != 0) {
       scale = static_cast<double>(sum.time_enabled) / sum.time_running;
     }
-    summaries.AddSummary(
-        CounterSummary(counters_info.event_name, counters_info.event_modifier,
-                       counters_info.group_id, sum.value, scale, false, csv_));
+    summaries.Summaries().emplace_back(counters_info.event_name, counters_info.event_modifier,
+                                       counters_info.group_id, sum.value, scale, false, csv_);
+    counters_always_available &= summaries.Summaries().back().IsMonitoredAllTheTime();
   }
   summaries.AutoGenerateSummaries();
   summaries.GenerateComments(duration_in_sec);
@@ -736,6 +839,11 @@ bool StatCommand::ShowCounters(const std::vector<CountersInfo>& counters,
     fprintf(fp, "Total test time,%lf,seconds,\n", duration_in_sec);
   else
     fprintf(fp, "\nTotal test time: %lf seconds.\n", duration_in_sec);
+
+  if (!counters_always_available) {
+    LOG(WARNING) << "Some hardware counters are not always available (scale < 100%). "
+                 << "Try --use-devfreq-counters if on a rooted device.";
+  }
   return true;
 }
 
