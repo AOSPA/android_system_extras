@@ -41,6 +41,7 @@ import filecmp
 import fnmatch
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -56,7 +57,7 @@ from binary_cache_builder import BinaryCacheBuilder
 from simpleperf_report_lib import ReportLib
 from utils import log_exit, log_info, log_fatal
 from utils import AdbHelper, Addr2Nearestline, bytes_to_str, find_tool_path, get_script_dir
-from utils import is_python3, is_windows, Objdump, ReadElf, remove, SourceFileSearcher
+from utils import is_elf_file, is_python3, is_windows, Objdump, ReadElf, remove, SourceFileSearcher
 from utils import str_to_bytes
 
 try:
@@ -67,6 +68,34 @@ except ImportError:
     HAS_GOOGLE_PROTOBUF = False
 
 INFERNO_SCRIPT = os.path.join(get_script_dir(), "inferno.bat" if is_windows() else "./inferno.sh")
+
+
+class TestLogger(object):
+    """ Write test progress in sys.stderr and keep verbose log in log file. """
+    def __init__(self):
+        self.log_file = self.get_log_file(3 if is_python3() else 2)
+        self.log_fh = open(self.log_file, 'w')
+        logging.basicConfig(filename=self.log_file)
+
+    @staticmethod
+    def get_log_file(python_version):
+        return 'test_python_%d.log' % python_version
+
+    def writeln(self, s):
+        return self.write(s + '\n')
+
+    def write(self, s):
+        sys.stderr.write(s)
+        self.log_fh.write(s)
+        # Child processes can also write to log file, so flush it immediately to keep the order.
+        self.flush()
+
+    def flush(self):
+        self.log_fh.flush()
+
+
+TEST_LOGGER = TestLogger()
+
 
 def get_device_features():
     adb = AdbHelper()
@@ -113,9 +142,10 @@ class TestBase(unittest.TestCase):
         use_shell = args[0].endswith('.bat')
         try:
             if not return_output:
-                returncode = subprocess.call(args, shell=use_shell)
+                returncode = subprocess.call(args, shell=use_shell, stderr=TEST_LOGGER.log_fh)
             else:
-                subproc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=use_shell)
+                subproc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                           stderr=TEST_LOGGER.log_fh, shell=use_shell)
                 (output_data, _) = subproc.communicate()
                 output_data = bytes_to_str(output_data)
                 returncode = subproc.returncode
@@ -578,8 +608,13 @@ class TestExampleWithNative(TestExampleBase):
              "__start_thread"])
 
     def test_pprof_proto_generator(self):
+        check_strings_with_lines = [
+            "native-lib.cpp",
+            "BusyLoopThread",
+            # Check if dso name in perf.data is replaced by binary path in binary_cache.
+            'filename: binary_cache/data/app/com.example.simpleperf.simpleperfexamplewithnative-']
         self.common_test_pprof_proto_generator(
-            check_strings_with_lines=["native-lib.cpp", "BusyLoopThread"],
+            check_strings_with_lines,
             check_strings_without_lines=["BusyLoopThread"])
 
     def test_inferno(self):
@@ -1016,7 +1051,7 @@ class TestTools(unittest.TestCase):
                 {
                     'func_addr': 0x840,
                     'addr': 0x840,
-                    'source': 'system/extras/simpleperf/runtest/two_functions.cpp:7',
+                    'source': 'system/extras/simpleperf/runtest/two_functions.cpp:6',
                     'function': 'Function1()',
                 },
                 {
@@ -1065,7 +1100,7 @@ class TestTools(unittest.TestCase):
                     expected_lines.append(int(items[1]))
                 for line in test_addr['function'].split('\n'):
                     expected_functions.append(line.strip())
-                self.assertEquals(len(expected_files), len(expected_functions))
+                self.assertEqual(len(expected_files), len(expected_functions))
 
                 actual_source = addr2line.get_addr_source(dso, test_addr['addr'])
                 self.assertTrue(actual_source is not None)
@@ -1170,23 +1205,33 @@ class TestTools(unittest.TestCase):
         def format_path(path):
             return path.replace('/', os.sep)
         # Find a C++ file with pure file name.
-        self.assertEquals(
+        self.assertEqual(
             format_path('testdata/SimpleperfExampleWithNative/app/src/main/cpp/native-lib.cpp'),
             searcher.get_real_path('native-lib.cpp'))
         # Find a C++ file with an absolute file path.
-        self.assertEquals(
+        self.assertEqual(
             format_path('testdata/SimpleperfExampleWithNative/app/src/main/cpp/native-lib.cpp'),
             searcher.get_real_path('/data/native-lib.cpp'))
         # Find a Java file.
-        self.assertEquals(
+        self.assertEqual(
             format_path('testdata/SimpleperfExampleWithNative/app/src/main/java/com/example/' +
                         'simpleperf/simpleperfexamplewithnative/MainActivity.java'),
             searcher.get_real_path('simpleperfexamplewithnative/MainActivity.java'))
         # Find a Kotlin file.
-        self.assertEquals(
+        self.assertEqual(
             format_path('testdata/SimpleperfExampleOfKotlin/app/src/main/java/com/example/' +
                         'simpleperf/simpleperfexampleofkotlin/MainActivity.kt'),
             searcher.get_real_path('MainActivity.kt'))
+
+    def test_is_elf_file(self):
+        self.assertTrue(is_elf_file(os.path.join(
+            'testdata', 'simpleperf_runtest_two_functions_arm')))
+        with open('not_elf', 'wb') as fh:
+            fh.write(b'\x90123')
+        try:
+            self.assertFalse(is_elf_file('not_elf'))
+        finally:
+            remove('not_elf')
 
 
 class TestNativeLibDownloader(unittest.TestCase):
@@ -1479,6 +1524,10 @@ class TestPprofProtoGenerator(TestBase):
         self.assertNotIn(key1, output)
         self.assertIn(key2, output)
 
+    def test_build_id(self):
+        """ Test the build ids generated are not padded with zeros. """
+        self.assertIn('build_id: e3e938cc9e40de2cfe1a5ac7595897de(', self.run_generator())
+
 
 def get_all_tests():
     tests = []
@@ -1491,16 +1540,18 @@ def get_all_tests():
     return sorted(tests)
 
 
-def run_tests(tests, repeats):
+def run_tests(tests, repeats, python_version):
     os.chdir(get_script_dir())
     build_testdata()
     argv = [sys.argv[0]] + tests
+    test_runner = unittest.TextTestRunner(stream=TEST_LOGGER, verbosity=2)
     for repeat in range(repeats):
-        log_info('Run tests with python %d for %dth time\n%s' % (
-            3 if is_python3() else 2, repeat + 1, '\n'.join(tests)))
-        test_program = unittest.main(argv=argv, failfast=True, verbosity=2, exit=False)
+        print('Run tests with python %d for %dth time\n%s' % (
+            python_version, repeat + 1, '\n'.join(tests)), file=TEST_LOGGER)
+        test_program = unittest.main(argv=argv, testRunner=test_runner, exit=False)
         if not test_program.result.wasSuccessful():
-            sys.exit(1)
+            return False
+    return True
 
 
 def main():
@@ -1510,12 +1561,14 @@ def main():
     parser.add_argument('--python-version', choices=['2', '3', 'both'], default='both', help="""
                         Run tests on which python versions.""")
     parser.add_argument('--repeat', type=int, nargs=1, default=[1], help='run test multiple times')
+    parser.add_argument('--no-test-result', dest='report_test_result',
+                        action='store_false', help="Don't report test result.")
     parser.add_argument('pattern', nargs='*', help='Run tests matching the selected pattern.')
     args = parser.parse_args()
     tests = get_all_tests()
     if args.list_tests:
         print('\n'.join(tests))
-        return
+        return True
     if args.test_from:
         start_pos = 0
         while start_pos < len(tests) and tests[start_pos] != args.test_from[0]:
@@ -1534,24 +1587,34 @@ def main():
             log_exit('No tests are matched.')
 
     if AdbHelper().get_android_version() < 7:
-        log_info("Skip tests on Android version < N.")
-        sys.exit(0)
+        print("Skip tests on Android version < N.", file=TEST_LOGGER)
+        return False
 
     if args.python_version == 'both':
         python_versions = [2, 3]
     else:
         python_versions = [int(args.python_version)]
+    test_results = []
     current_version = 3 if is_python3() else 2
     for version in python_versions:
-        if version != current_version:
+        if version == current_version:
+            test_result = run_tests(tests, args.repeat[0], version)
+        else:
             argv = ['python3' if version == 3 else 'python']
             argv.append(os.path.join(get_script_dir(), 'test.py'))
             argv += sys.argv[1:]
-            argv += ['--python-version', str(version)]
-            subprocess.check_call(argv)
-        else:
-            run_tests(tests, args.repeat[0])
+            argv += ['--python-version', str(version), '--no-test-result']
+            test_result = subprocess.call(argv) == 0
+        test_results.append(test_result)
+
+    if args.report_test_result:
+        for version, test_result in zip(python_versions, test_results):
+            if not test_result:
+                print('Tests with python %d failed, see %s for details.' %
+                      (version, TEST_LOGGER.get_log_file(version)), file=TEST_LOGGER)
+
+    return test_results.count(False) == 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(0 if main() else 1)
