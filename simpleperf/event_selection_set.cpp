@@ -290,18 +290,6 @@ bool EventSelectionSet::ExcludeKernel() const {
   return true;
 }
 
-bool EventSelectionSet::HasInplaceSampler() const {
-  for (const auto& group : groups_) {
-    for (const auto& sel : group) {
-      if (sel.event_attr.type == SIMPLEPERF_TYPE_USER_SPACE_SAMPLERS &&
-          sel.event_attr.config == SIMPLEPERF_CONFIG_INPLACE_SAMPLER) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 std::vector<EventAttrWithId> EventSelectionSet::GetEventAttrWithId() const {
   std::vector<EventAttrWithId> result;
   for (const auto& group : groups_) {
@@ -310,9 +298,6 @@ std::vector<EventAttrWithId> EventSelectionSet::GetEventAttrWithId() const {
       attr_id.attr = &selection.event_attr;
       for (const auto& fd : selection.event_fds) {
         attr_id.ids.push_back(fd->Id());
-      }
-      if (!selection.inplace_samplers.empty()) {
-        attr_id.ids.push_back(selection.inplace_samplers[0]->Id());
       }
       result.push_back(attr_id);
     }
@@ -550,64 +535,34 @@ bool EventSelectionSet::OpenEventFiles(const std::vector<int>& on_cpus) {
   }
   std::map<pid_t, std::set<pid_t>> process_map = PrepareThreads(processes_, threads_);
   for (auto& group : groups_) {
-    if (IsUserSpaceSamplerGroup(group)) {
-      if (!OpenUserSpaceSamplersOnGroup(group, process_map)) {
-        return false;
-      }
-    } else {
-      for (const auto& pair : process_map) {
-        size_t success_count = 0;
-        std::string failed_event_type;
-        for (const auto& tid : pair.second) {
-          // override cpu list if event's PMU has a cpumask as those PMUs are
-          // agnostic to cpu and it's meaningless to specify cpus for them.
-          auto& evsel = group[0];
-          if (!evsel.allowed_cpus.empty())
-            cpus = evsel.allowed_cpus;
-          for (const auto& cpu : cpus) {
-            if (OpenEventFilesOnGroup(group, tid, cpu, &failed_event_type)) {
-              success_count++;
-            }
+    for (const auto& pair : process_map) {
+      size_t success_count = 0;
+      std::string failed_event_type;
+      for (const auto& tid : pair.second) {
+        // override cpu list if event's PMU has a cpumask as those PMUs are
+        // agnostic to cpu and it's meaningless to specify cpus for them.
+        auto& evsel = group[0];
+        if (!evsel.allowed_cpus.empty()) cpus = evsel.allowed_cpus;
+        for (const auto& cpu : cpus) {
+          if (OpenEventFilesOnGroup(group, tid, cpu, &failed_event_type)) {
+            success_count++;
           }
         }
-        // We can't guarantee to open perf event file successfully for each thread on each cpu.
-        // Because threads may exit between PrepareThreads() and OpenEventFilesOnGroup(), and
-        // cpus may be offlined between GetOnlineCpus() and OpenEventFilesOnGroup().
-        // So we only check that we can at least monitor one thread for each process.
-        if (success_count == 0) {
-          PLOG(ERROR) << "failed to open perf event file for event_type "
-                      << failed_event_type << " for "
-                      << (pair.first == -1 ? "all threads"
-                                           : "threads in process " + std::to_string(pair.first));
-          return false;
-        }
+      }
+      // We can't guarantee to open perf event file successfully for each thread on each cpu.
+      // Because threads may exit between PrepareThreads() and OpenEventFilesOnGroup(), and
+      // cpus may be offlined between GetOnlineCpus() and OpenEventFilesOnGroup().
+      // So we only check that we can at least monitor one thread for each process.
+      if (success_count == 0) {
+        PLOG(ERROR) << "failed to open perf event file for event_type " << failed_event_type
+                    << " for "
+                    << (pair.first == -1 ? "all threads"
+                                         : "threads in process " + std::to_string(pair.first));
+        return false;
       }
     }
   }
   return ApplyFilters();
-}
-
-bool EventSelectionSet::IsUserSpaceSamplerGroup(EventSelectionGroup& group) {
-  return group.size() == 1 && group[0].event_attr.type == SIMPLEPERF_TYPE_USER_SPACE_SAMPLERS;
-}
-
-bool EventSelectionSet::OpenUserSpaceSamplersOnGroup(EventSelectionGroup& group,
-    const std::map<pid_t, std::set<pid_t>>& process_map) {
-  CHECK_EQ(group.size(), 1u);
-  for (auto& selection : group) {
-    if (selection.event_attr.type == SIMPLEPERF_TYPE_USER_SPACE_SAMPLERS &&
-        selection.event_attr.config == SIMPLEPERF_CONFIG_INPLACE_SAMPLER) {
-      for (auto& pair : process_map) {
-        std::unique_ptr<InplaceSamplerClient> sampler = InplaceSamplerClient::Create(
-            selection.event_attr, pair.first, pair.second);
-        if (sampler == nullptr) {
-          return false;
-        }
-        selection.inplace_samplers.push_back(std::move(sampler));
-      }
-    }
-  }
-  return true;
 }
 
 bool EventSelectionSet::ApplyFilters() {
@@ -740,189 +695,7 @@ bool EventSelectionSet::FinishReadMmapEventData() {
   if (!ReadMmapEventData(false)) {
     return false;
   }
-  if (!HasInplaceSampler()) {
-    return true;
-  }
-  // Inplace sampler server uses a buffer to cache samples before sending them, so we need to
-  // explicitly ask it to send the cached samples.
-  loop_.reset(new IOEventLoop);
-  size_t inplace_sampler_count = 0;
-  auto close_callback = [&]() {
-    if (--inplace_sampler_count == 0) {
-      return loop_->ExitLoop();
-    }
-    return true;
-  };
-  for (auto& group : groups_) {
-    for (auto& sel : group) {
-      for (auto& sampler : sel.inplace_samplers) {
-        if (!sampler->IsClosed()) {
-          if (!sampler->StopProfiling(*loop_, close_callback)) {
-            return false;
-          }
-          inplace_sampler_count++;
-        }
-      }
-    }
-  }
-  if (inplace_sampler_count == 0) {
-    return true;
-  }
-
-  // Set a timeout to exit the loop.
-  timeval tv;
-  tv.tv_sec = 1;
-  tv.tv_usec = 0;
-  if (!loop_->AddPeriodicEvent(tv, [&]() { return loop_->ExitLoop(); })) {
-    return false;
-  }
-  return loop_->RunLoop();
-}
-
-bool EventSelectionSet::HandleCpuHotplugEvents(const std::vector<int>& monitored_cpus,
-                                               double check_interval_in_sec) {
-  monitored_cpus_.insert(monitored_cpus.begin(), monitored_cpus.end());
-  online_cpus_ = GetOnlineCpus();
-  if (!loop_->AddPeriodicEvent(SecondToTimeval(check_interval_in_sec),
-                               [&]() { return DetectCpuHotplugEvents(); })) {
-    return false;
-  }
   return true;
-}
-
-bool EventSelectionSet::DetectCpuHotplugEvents() {
-  std::vector<int> new_cpus = GetOnlineCpus();
-  for (const auto& cpu : online_cpus_) {
-    if (std::find(new_cpus.begin(), new_cpus.end(), cpu) == new_cpus.end()) {
-      if (monitored_cpus_.empty() ||
-          monitored_cpus_.find(cpu) != monitored_cpus_.end()) {
-        LOG(INFO) << "Cpu " << cpu << " is offlined";
-        if (!HandleCpuOfflineEvent(cpu)) {
-          return false;
-        }
-      }
-    }
-  }
-  for (const auto& cpu : new_cpus) {
-    if (std::find(online_cpus_.begin(), online_cpus_.end(), cpu) ==
-        online_cpus_.end()) {
-      if (monitored_cpus_.empty() ||
-          monitored_cpus_.find(cpu) != monitored_cpus_.end()) {
-        LOG(INFO) << "Cpu " << cpu << " is onlined";
-        if (!HandleCpuOnlineEvent(cpu)) {
-          return false;
-        }
-      }
-    }
-  }
-  online_cpus_ = new_cpus;
-  return true;
-}
-
-bool EventSelectionSet::HandleCpuOfflineEvent(int cpu) {
-  if (!for_stat_cmd_) {
-    // Read mmap data here, so we won't lose the existing records of the
-    // offlined cpu.
-    if (!ReadMmapEventData(true)) {
-      return false;
-    }
-  }
-  if (record_read_thread_) {
-    std::vector<EventFd*> remove_fds;
-    for (auto& group : groups_) {
-      for (auto& selection : group) {
-        for (auto& fd : selection.event_fds) {
-          if (fd->Cpu() == cpu) {
-            remove_fds.push_back(fd.get());
-          }
-        }
-      }
-    }
-    if (!record_read_thread_->RemoveEventFds(remove_fds)) {
-      return false;
-    }
-  }
-  for (auto& group : groups_) {
-    for (auto& selection : group) {
-      for (auto it = selection.event_fds.begin(); it != selection.event_fds.end();) {
-        if ((*it)->Cpu() == cpu) {
-          if (for_stat_cmd_) {
-            CounterInfo counter;
-            if (!ReadCounter(it->get(), &counter)) {
-              return false;
-            }
-            selection.hotplugged_counters.push_back(counter);
-          }
-          it = selection.event_fds.erase(it);
-        } else {
-          ++it;
-        }
-      }
-    }
-  }
-  return true;
-}
-
-bool EventSelectionSet::HandleCpuOnlineEvent(int cpu) {
-  // We need to start profiling when opening new event files.
-  SetEnableOnExec(false);
-  std::map<pid_t, std::set<pid_t>> process_map = PrepareThreads(processes_, threads_);
-  for (auto& group : groups_) {
-    if (IsUserSpaceSamplerGroup(group)) {
-      continue;
-    }
-    for (const auto& pair : process_map) {
-      for (const auto& tid : pair.second) {
-        std::string failed_event_type;
-        if (!OpenEventFilesOnGroup(group, tid, cpu, &failed_event_type)) {
-          // If failed to open event files, maybe the cpu has been offlined.
-          PLOG(WARNING) << "failed to open perf event file for event_type "
-                        << failed_event_type << " for "
-                        << (tid == -1 ? "all threads" : "thread " + std::to_string(tid))
-                        << " on cpu " << cpu;
-        }
-      }
-    }
-  }
-  if (record_read_thread_) {
-    // Prepare mapped buffer.
-    if (!CreateMappedBufferForCpu(cpu)) {
-      return false;
-    }
-    // Send a EventIdRecord.
-    std::vector<uint64_t> event_id_data;
-    uint64_t attr_id = 0;
-    for (const auto& group : groups_) {
-      for (const auto& selection : group) {
-        for (const auto& event_fd : selection.event_fds) {
-          if (event_fd->Cpu() == cpu) {
-            event_id_data.push_back(attr_id);
-            event_id_data.push_back(event_fd->Id());
-          }
-        }
-        ++attr_id;
-      }
-    }
-    EventIdRecord r(event_id_data);
-    if (!record_callback_(&r)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool EventSelectionSet::CreateMappedBufferForCpu(int cpu) {
-  std::vector<EventFd*> event_fds;
-  for (auto& group : groups_) {
-    for (auto& selection : group) {
-      for (auto& fd : selection.event_fds) {
-        if (fd->Cpu() == cpu) {
-          event_fds.push_back(fd.get());
-        }
-      }
-    }
-  }
-  return record_read_thread_->AddEventFds(event_fds);
 }
 
 bool EventSelectionSet::StopWhenNoMoreTargets(double check_interval_in_sec) {
@@ -952,11 +725,6 @@ bool EventSelectionSet::HasSampler() {
     for (auto& sel : group) {
       if (!sel.event_fds.empty()) {
         return true;
-      }
-      for (auto& sampler : sel.inplace_samplers) {
-        if (!sampler->IsClosed()) {
-          return true;
-        }
       }
     }
   }
