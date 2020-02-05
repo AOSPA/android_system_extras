@@ -41,11 +41,11 @@ bool IsBranchSamplingSupported() {
   perf_event_attr attr = CreateDefaultPerfEventAttr(*type);
   attr.sample_type |= PERF_SAMPLE_BRANCH_STACK;
   attr.branch_sample_type = PERF_SAMPLE_BRANCH_ANY;
-  return IsEventAttrSupported(attr);
+  return IsEventAttrSupported(attr, type->name);
 }
 
 bool IsDwarfCallChainSamplingSupported() {
-  const EventType* type = FindEventTypeByName("cpu-cycles");
+  const EventType* type = FindEventTypeByName("cpu-clock");
   if (type == nullptr) {
     return false;
   }
@@ -55,7 +55,7 @@ bool IsDwarfCallChainSamplingSupported() {
   attr.exclude_callchain_user = 1;
   attr.sample_regs_user = GetSupportedRegMask(GetBuildArch());
   attr.sample_stack_user = 8192;
-  return IsEventAttrSupported(attr);
+  return IsEventAttrSupported(attr, type->name);
 }
 
 bool IsDumpingRegsForTracepointEventsSupported() {
@@ -79,11 +79,10 @@ bool IsDumpingRegsForTracepointEventsSupported() {
   attr.freq = 0;
   attr.sample_period = 1;
   std::unique_ptr<EventFd> event_fd =
-      EventFd::OpenEventFile(attr, thread_id, -1, nullptr);
-  if (event_fd == nullptr) {
-    return false;
-  }
-  if (!event_fd->CreateMappedBuffer(4, true)) {
+      EventFd::OpenEventFile(attr, thread_id, -1, nullptr, event_type->name);
+  if (event_fd == nullptr || !event_fd->CreateMappedBuffer(4, true)) {
+    done = true;
+    thread.join();
     return false;
   }
   done = true;
@@ -107,7 +106,7 @@ bool IsSettingClockIdSupported() {
   // Do the real check only once and keep the result in a static variable.
   static int is_supported = -1;
   if (is_supported == -1) {
-    const EventType* type = FindEventTypeByName("cpu-cycles");
+    const EventType* type = FindEventTypeByName("cpu-clock");
     if (type == nullptr) {
       is_supported = 0;
     } else {
@@ -116,20 +115,20 @@ bool IsSettingClockIdSupported() {
       perf_event_attr attr = CreateDefaultPerfEventAttr(*type);
       attr.use_clockid = 1;
       attr.clockid = CLOCK_MONOTONIC;
-      is_supported = IsEventAttrSupported(attr) ? 1 : 0;
+      is_supported = IsEventAttrSupported(attr, type->name) ? 1 : 0;
     }
   }
   return is_supported;
 }
 
 bool IsMmap2Supported() {
-  const EventType* type = FindEventTypeByName("cpu-cycles");
+  const EventType* type = FindEventTypeByName("cpu-clock");
   if (type == nullptr) {
     return false;
   }
   perf_event_attr attr = CreateDefaultPerfEventAttr(*type);
   attr.mmap2 = 1;
-  return IsEventAttrSupported(attr);
+  return IsEventAttrSupported(attr, type->name);
 }
 
 EventSelectionSet::EventSelectionSet(bool for_stat_cmd)
@@ -198,7 +197,8 @@ bool EventSelectionSet::BuildAndCheckEventSelection(const std::string& event_nam
     }
   }
   // PMU events are provided by kernel, so they should be supported
-  if (!event_type->event_type.IsPmuEvent() && !IsEventAttrSupported(selection->event_attr)) {
+  if (!event_type->event_type.IsPmuEvent() &&
+      !IsEventAttrSupported(selection->event_attr, selection->event_type_modifier.name)) {
     LOG(ERROR) << "Event type '" << event_type->name
                << "' is not supported on the device";
     return false;
@@ -483,8 +483,8 @@ bool EventSelectionSet::OpenEventFilesOnGroup(EventSelectionGroup& group,
   // successfully or all failed to open.
   EventFd* group_fd = nullptr;
   for (auto& selection : group) {
-    std::unique_ptr<EventFd> event_fd =
-        EventFd::OpenEventFile(selection.event_attr, tid, cpu, group_fd, false);
+    std::unique_ptr<EventFd> event_fd = EventFd::OpenEventFile(
+        selection.event_attr, tid, cpu, group_fd, selection.event_type_modifier.name, false);
     if (!event_fd) {
         *failed_event_type = selection.event_type_modifier.name;
         return false;
@@ -501,65 +501,56 @@ bool EventSelectionSet::OpenEventFilesOnGroup(EventSelectionGroup& group,
   return true;
 }
 
-static std::map<pid_t, std::set<pid_t>> PrepareThreads(const std::set<pid_t>& processes,
-                                                       const std::set<pid_t>& threads) {
-  std::map<pid_t, std::set<pid_t>> result;
+static std::set<pid_t> PrepareThreads(const std::set<pid_t>& processes,
+                                      const std::set<pid_t>& threads) {
+  std::set<pid_t> result = threads;
   for (auto& pid : processes) {
     std::vector<pid_t> tids = GetThreadsInProcess(pid);
-    std::set<pid_t>& threads_in_process = result[pid];
-    threads_in_process.insert(tids.begin(), tids.end());
-  }
-  for (auto& tid : threads) {
-    // tid = -1 means monitoring all threads.
-    if (tid == -1) {
-      result[-1].insert(-1);
-    } else {
-      pid_t pid;
-      if (GetProcessForThread(tid, &pid)) {
-        result[pid].insert(tid);
-      }
-    }
+    result.insert(tids.begin(), tids.end());
   }
   return result;
 }
 
-bool EventSelectionSet::OpenEventFiles(const std::vector<int>& on_cpus) {
-  std::vector<int> cpus = on_cpus;
-  if (!cpus.empty()) {
-    // cpus = {-1} means open an event file for all cpus.
-    if (!(cpus.size() == 1 && cpus[0] == -1) && !CheckIfCpusOnline(cpus)) {
+bool EventSelectionSet::OpenEventFiles(const std::vector<int>& cpus) {
+  std::vector<int> monitored_cpus;
+  if (cpus.empty()) {
+    monitored_cpus = GetOnlineCpus();
+  } else if (cpus.size() == 1 && cpus[0] == -1) {
+    monitored_cpus = {-1};
+  } else {
+    if (!CheckIfCpusOnline(cpus)) {
       return false;
     }
-  } else {
-    cpus = GetOnlineCpus();
+    monitored_cpus = cpus;
   }
-  std::map<pid_t, std::set<pid_t>> process_map = PrepareThreads(processes_, threads_);
+  std::set<pid_t> threads = PrepareThreads(processes_, threads_);
   for (auto& group : groups_) {
-    for (const auto& pair : process_map) {
-      size_t success_count = 0;
-      std::string failed_event_type;
-      for (const auto& tid : pair.second) {
+    size_t success_count = 0;
+    std::string failed_event_type;
+    for (const auto tid : threads) {
+      const std::vector<int>* pcpus = &monitored_cpus;
+      if (!group[0].allowed_cpus.empty()) {
         // override cpu list if event's PMU has a cpumask as those PMUs are
         // agnostic to cpu and it's meaningless to specify cpus for them.
-        auto& evsel = group[0];
-        if (!evsel.allowed_cpus.empty()) cpus = evsel.allowed_cpus;
-        for (const auto& cpu : cpus) {
-          if (OpenEventFilesOnGroup(group, tid, cpu, &failed_event_type)) {
-            success_count++;
-          }
+        pcpus = &group[0].allowed_cpus;
+      }
+      for (const auto& cpu : *pcpus) {
+        if (OpenEventFilesOnGroup(group, tid, cpu, &failed_event_type)) {
+          success_count++;
         }
       }
-      // We can't guarantee to open perf event file successfully for each thread on each cpu.
-      // Because threads may exit between PrepareThreads() and OpenEventFilesOnGroup(), and
-      // cpus may be offlined between GetOnlineCpus() and OpenEventFilesOnGroup().
-      // So we only check that we can at least monitor one thread for each process.
-      if (success_count == 0) {
-        PLOG(ERROR) << "failed to open perf event file for event_type " << failed_event_type
-                    << " for "
-                    << (pair.first == -1 ? "all threads"
-                                         : "threads in process " + std::to_string(pair.first));
-        return false;
+    }
+    // We can't guarantee to open perf event file successfully for each thread on each cpu.
+    // Because threads may exit between PrepareThreads() and OpenEventFilesOnGroup(), and
+    // cpus may be offlined between GetOnlineCpus() and OpenEventFilesOnGroup().
+    // So we only check that we can at least monitor one thread for each event group.
+    if (success_count == 0) {
+      int error_number = errno;
+      PLOG(ERROR) << "failed to open perf event file for event_type " << failed_event_type;
+      if (error_number == EMFILE) {
+        LOG(ERROR) << "Please increase hard limit of open file numbers.";
       }
+      return false;
     }
   }
   return ApplyFilters();

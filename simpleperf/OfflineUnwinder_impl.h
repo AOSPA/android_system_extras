@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,21 @@
  * limitations under the License.
  */
 
-#include <gtest/gtest.h>
+#pragma once
 
-#include <sys/system_properties.h>
+#include <unwindstack/Maps.h>
 
-#include "profile-extras.h"
+#include "thread_tree.h"
 
-static int flush_count = 0;
+namespace simpleperf {
 
-extern "C" {
-void __gcov_flush() {
-  flush_count++;
-}
-}
+class UnwindMaps : public unwindstack::Maps {
+ public:
+  void UpdateMaps(const MapSet& map_set);
 
-TEST(profile_extras, smoke) {
-  flush_count = 0;
+ private:
+  uint64_t version_ = 0u;
+  std::vector<const MapEntry*> entries_;
+};
 
-  ASSERT_EQ(0, flush_count);
-  kill(getpid(), COVERAGE_FLUSH_SIGNAL);
-  sleep(2);
-  ASSERT_EQ(1, flush_count);
-}
+}  // namespace simpleperf
