@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,40 +15,33 @@
  */
 
 #include <errno.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
-#include <string.h>
-#include <libgen.h> // For POSIX basename().
-
-// Use _system_properties.h to use __system_property_wait_any()
-#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
-#include <sys/_system_properties.h>
 
 #include "profile-extras.h"
 
 extern "C" {
 
-void __gcov_flush(void);
+static sighandler_t chained_signal_handler = SIG_ERR;
 
-// storing SIG_ERR helps us detect (unlikely) looping.
-static sighandler_t chained_gcov_signal_handler = SIG_ERR;
+int __llvm_profile_write_file(void);
 
-static void gcov_signal_handler(int signum) {
-  __gcov_flush();
-  if (chained_gcov_signal_handler != SIG_ERR &&
-      chained_gcov_signal_handler != SIG_IGN &&
-      chained_gcov_signal_handler != SIG_DFL) {
-    (chained_gcov_signal_handler)(signum);
+static void llvm_signal_handler(__unused int signum) {
+  __llvm_profile_write_file();
+
+  if (chained_signal_handler != SIG_ERR &&
+      chained_signal_handler != SIG_IGN &&
+      chained_signal_handler != SIG_DFL) {
+    (chained_signal_handler)(signum);
   }
 }
 
 __attribute__((weak)) int init_profile_extras_once = 0;
 
 // Initialize libprofile-extras:
-// - Install a signal handler that triggers __gcov_flush on <COVERAGE_FLUSH_SIGNAL>.
+// - Install a signal handler that triggers __llvm_profile_write_file on <COVERAGE_FLUSH_SIGNAL>.
 //
-// We want this initiazlier to run during load time.
+// We want this initializer to run during load time.
 //
 // Just marking init_profile_extras() with __attribute__((constructor)) isn't
 // enough since the linker drops it from its output since no other symbol from
@@ -61,15 +54,14 @@ __attribute__((constructor)) int init_profile_extras(void) {
     return 0;
   init_profile_extras_once = 1;
 
-  // is this instance already registered?
-  if (chained_gcov_signal_handler != SIG_ERR) {
+  if (chained_signal_handler != SIG_ERR) {
     return -1;
   }
-  sighandler_t ret1 = signal(COVERAGE_FLUSH_SIGNAL, gcov_signal_handler);
+  sighandler_t ret1 = signal(COVERAGE_FLUSH_SIGNAL, llvm_signal_handler);
   if (ret1 == SIG_ERR) {
     return -1;
   }
-  chained_gcov_signal_handler = ret1;
+  chained_signal_handler = ret1;
 
   return 0;
 }

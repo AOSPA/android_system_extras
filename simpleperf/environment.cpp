@@ -186,7 +186,7 @@ void GetKernelAndModuleMmaps(KernelMmap* kernel_mmap, std::vector<KernelMmap>* m
   }
 }
 
-static bool ReadThreadNameAndPid(pid_t tid, std::string* comm, pid_t* pid) {
+bool ReadThreadNameAndPid(pid_t tid, std::string* comm, pid_t* pid) {
   android::procinfo::ProcessInfo procinfo;
   if (!android::procinfo::GetProcessInfo(tid, &procinfo)) {
     return false;
@@ -910,4 +910,16 @@ std::string GetCompleteProcessName(pid_t pid) {
     }
   }
   return s;
+}
+
+const char* GetTraceFsDir() {
+  static const char* tracefs_dirs[] = {
+    "/sys/kernel/debug/tracing", "/sys/kernel/tracing"
+  };
+  for (const char* path : tracefs_dirs) {
+    if (IsDir(path)) {
+      return path;
+    }
+  }
+  return nullptr;
 }
